@@ -1,0 +1,6 @@
+{
+  "name": "AIS Vessel path predictor & anomaly monitor",
+  "description": "An interactive workspace for AIS vessel path prediction and anomaly monitoring. Includes CSV upload/generation, path mapping, step-by-step feature engineering, LightGBM/XGBoost simulation, and Python production pipeline export.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
