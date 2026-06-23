@@ -1,413 +1,839 @@
-import { VesselPreset, AISPoint } from './types';
+import { VesselPreset, AISPoint, ColumnMapping, DiagnosticResult, QualityIssue } from './types';
 
-// Let's establish Busan - Tsushima Strait sea lane coordinate bounds roughly
-// Latitude: 34.5 to 35.2
-// Longitude: 128.8 to 129.8
+// CSV 파싱 유틸리티 (쌍따옴표 내 쉼표, 개행 등 완전 지원하는 가볍고 견고한 파서)
+export function parseCsv(text: string): string[][] {
+  const result: string[][] = [];
+  let row: string[] = [];
+  let inQuotes = false;
+  let currentValue = "";
 
-export const VESSEL_PRESETS: VesselPreset[] = [
+  for (let i = 0; i < text.length; i++) {
+    const char = text[i];
+    const nextChar = text[i + 1];
+
+    if (char === '"') {
+      if (inQuotes && nextChar === '"') {
+        currentValue += '"';
+        i++; // skip next quote
+      } else {
+        inQuotes = !inQuotes;
+      }
+    } else if (char === ',' && !inQuotes) {
+      row.push(currentValue.trim());
+      currentValue = "";
+    } else if ((char === '\r' || char === '\n') && !inQuotes) {
+      if (char === '\r' && nextChar === '\n') {
+        i++; // skip \n
+      }
+      row.push(currentValue.trim());
+      if (row.length > 1 || row[0] !== "") {
+        result.push(row);
+      }
+      row = [];
+      currentValue = "";
+    } else {
+      currentValue += char;
+    }
+  }
+  
+  if (currentValue !== "" || row.length > 0) {
+    row.push(currentValue.trim());
+    result.push(row);
+  }
+
+  return result;
+}
+
+// JSON에서 CSV 문자열로 변환하는 유틸리티 (내보내기 용도)
+export function jsonToCsv(headers: string[], rows: Record<string, string>[]): string {
+  const csvHeaders = headers.join(",");
+  const csvRows = rows.map(row => 
+    headers.map(header => {
+      const val = row[header] || "";
+      if (val.includes(",") || val.includes('"') || val.includes("\n")) {
+        return `"${val.replace(/"/g, '""')}"`;
+      }
+      return val;
+    }).join(",")
+  );
+  return [csvHeaders, ...csvRows].join("\n");
+}
+
+// 컬럼명을 자동 인식하는 스마트 칼럼 맵퍼
+export function autoDetectColumns(headers: string[]): ColumnMapping {
+  const mapping: ColumnMapping = {
+    mmsi: null,
+    timestamp: null,
+    lat: null,
+    lon: null,
+    sog: null,
+    cog: null,
+    heading: null,
+    vesselName: null,
+    callSign: null,
+    lengthTop: null,
+    lengthBottom: null,
+    lengthLeft: null,
+    lengthRight: null
+  };
+
+  const clean = (s: string) => s.toLowerCase().replace(/[\s_\-]/g, "");
+
+  headers.forEach(h => {
+    const c = clean(h);
+    
+    // MMSI
+    if (c === "mmsi" || c === "선박번호" || c === "선박식별번호" || c === "id" || c === "vesselid") {
+      if (!mapping.mmsi) mapping.mmsi = h;
+    }
+    // Timestamp
+    else if (c === "timestamp" || c === "수신시각" || c === "시간" || c === "일시" || c === "datetime" || c === "date" || c === "time" || c === "등록일시") {
+      if (!mapping.timestamp) mapping.timestamp = h;
+    }
+    // Latitude
+    else if (c === "latitude" || c === "lat" || c === "위도" || c === "y" || c === "위도좌표") {
+      if (!mapping.lat) mapping.lat = h;
+    }
+    // Longitude
+    else if (c === "longitude" || c === "lon" || c === "lng" || c === "경도" || c === "x" || c === "경도좌표") {
+      if (!mapping.lon) mapping.lon = h;
+    }
+    // SOG
+    else if (c === "sog" || c === "속도" || c === "speed" || c === "선속" || c === "속력" || c === "sog속도") {
+      if (!mapping.sog) mapping.sog = h;
+    }
+    // COG
+    else if (c === "cog" || c === "선수방위" || c === "course" || c === "침로" || c === "방위") {
+      if (!mapping.cog) mapping.cog = h;
+    }
+    // Heading
+    else if (c === "heading" || c === "헤딩" || c === "선수향" || c === "선향") {
+      if (!mapping.heading) mapping.heading = h;
+    }
+    // Vessel Name
+    else if (c === "vesselname" || c === "선박명" || c === "name" || c === "선박이름" || c === "이름") {
+      if (!mapping.vesselName) mapping.vesselName = h;
+    }
+    // Call Sign
+    else if (c === "callsign" || c === "호출부호" || c === "호출" || c === "선박호출부호") {
+      if (!mapping.callSign) mapping.callSign = h;
+    }
+    // Length Top (상)
+    else if (c.includes("길이상") || c.includes("lengthtop") || c.includes("dimensionaltop")) {
+      mapping.lengthTop = h;
+    }
+    // Length Bottom (하)
+    else if (c.includes("길이하") || c.includes("lengthbottom") || c.includes("dimensionalbottom")) {
+      mapping.lengthBottom = h;
+    }
+    // Length Left (좌)
+    else if (c.includes("길이좌") || c.includes("lengthleft") || c.includes("dimensionalleft")) {
+      mapping.lengthLeft = h;
+    }
+    // Length Right (우)
+    else if (c.includes("길이우") || c.includes("lengthright") || c.includes("dimensionalright")) {
+      mapping.lengthRight = h;
+    }
+  });
+
+  return mapping;
+}
+
+// 진단 리포트를 생성하는 고등 오창 분석 엔진
+export function performDiagnostic(
+  headers: string[],
+  parsedRows: string[][],
+  mapping: ColumnMapping,
+  maxSpeedThreshold: number = 40
+): DiagnosticResult {
+  const totalRecords = parsedRows.length;
+  const issues: QualityIssue[] = [];
+  
+  // 필수 필드 매핑 검사
+  const missingRequiredColumns: string[] = [];
+  if (!mapping.mmsi) missingRequiredColumns.push("MMSI (선박식별번호 / 선박번호)");
+  if (!mapping.timestamp) missingRequiredColumns.push("Timestamp (수신시각 / 시간)");
+  if (!mapping.lat) missingRequiredColumns.push("Latitude (위도)");
+  if (!mapping.lon) missingRequiredColumns.push("Longitude (경도)");
+
+  const isPredictable = missingRequiredColumns.length === 0;
+
+  // 인덱스 맵 생성
+  const idxMap = {
+    mmsi: mapping.mmsi ? headers.indexOf(mapping.mmsi) : -1,
+    timestamp: mapping.timestamp ? headers.indexOf(mapping.timestamp) : -1,
+    lat: mapping.lat ? headers.indexOf(mapping.lat) : -1,
+    lon: mapping.lon ? headers.indexOf(mapping.lon) : -1,
+    sog: mapping.sog ? headers.indexOf(mapping.sog) : -1,
+    cog: mapping.cog ? headers.indexOf(mapping.cog) : -1,
+    heading: mapping.heading ? headers.indexOf(mapping.heading) : -1,
+    vesselName: mapping.vesselName ? headers.indexOf(mapping.vesselName) : -1,
+    callSign: mapping.callSign ? headers.indexOf(mapping.callSign) : -1,
+    lengthTop: mapping.lengthTop ? headers.indexOf(mapping.lengthTop) : -1,
+    lengthBottom: mapping.lengthBottom ? headers.indexOf(mapping.lengthBottom) : -1,
+    lengthLeft: mapping.lengthLeft ? headers.indexOf(mapping.lengthLeft) : -1,
+    lengthRight: mapping.lengthRight ? headers.indexOf(mapping.lengthRight) : -1,
+  };
+
+  const uniqueVessels = new Set<string>();
+  let missingVesselNameCount = 0;
+  let missingCallSignCount = 0;
+  let missingImoCount = 0;
+  let PlateCount = 0;
+  
+  let sogAnomalyCount = 0;
+  let cogAnomalyCount = 0;
+  let headingAnomalyCount = 0;
+  let sizeAnomalyCount = 0;
+
+  // 데이터 한 행씩 정독 분석
+  parsedRows.forEach((row, rIdx) => {
+    const rowNum = rIdx + 1;
+    const mmsiVal = idxMap.mmsi !== -1 ? row[idxMap.mmsi] || "" : "";
+    const timeVal = idxMap.timestamp !== -1 ? row[idxMap.timestamp] || "" : "";
+    
+    if (mmsiVal) {
+      uniqueVessels.add(mmsiVal);
+    } else if (idxMap.mmsi !== -1) {
+      issues.push({
+        rowIdx: rowNum,
+        mmsi: "N/A",
+        timestamp: timeVal || "N/A",
+        column: mapping.mmsi || "MMSI",
+        value: "",
+        issueType: 'MISSING',
+        severity: 'high',
+        message: `${rowNum}행: 선박 고유식별값(MMSI/선박번호)이 비어있습니다.`
+      });
+    }
+
+    // 선박명 누락
+    if (idxMap.vesselName !== -1) {
+      const vName = row[idxMap.vesselName] || "";
+      if (!vName.trim()) {
+        missingVesselNameCount++;
+        if (rIdx < 20) {
+          issues.push({
+            rowIdx: rowNum,
+            mmsi: mmsiVal || "미상",
+            timestamp: timeVal || "N/A",
+            column: mapping.vesselName || "선박명",
+            value: "",
+            issueType: 'MISSING',
+            severity: 'low',
+            message: `${rowNum}행: 선박 한글/영문명이 누락되었습니다.`
+          });
+        }
+      }
+    } else {
+      missingVesselNameCount++;
+    }
+
+    // 호출부호 누락
+    if (idxMap.callSign !== -1) {
+      const call = row[idxMap.callSign] || "";
+      if (!call.trim()) {
+        missingCallSignCount++;
+      }
+    } else {
+      missingCallSignCount++;
+    }
+
+    // 위경도 누락 검사 (GPS 미수신)
+    if (idxMap.lat !== -1 && idxMap.lon !== -1) {
+      const latVal = parseFloat(row[idxMap.lat]);
+      const lonVal = parseFloat(row[idxMap.lon]);
+      if (isNaN(latVal) || isNaN(lonVal) || latVal === 0 || lonVal === 0 || latVal > 90 || latVal < -90 || lonVal > 180 || lonVal < -185) {
+        issues.push({
+          rowIdx: rowNum,
+          mmsi: mmsiVal || "미상",
+          timestamp: timeVal || "N/A",
+          column: `위도/경도`,
+          value: `lat: ${row[idxMap.lat]}, lon: ${row[idxMap.lon]}`,
+          issueType: 'ABSENT_COORDINATE',
+          severity: 'high',
+          message: `${rowNum}행: 위도/경도 값이 누락되었거나 비정상적인 극값 또는 0으로 표기되어 위치 추적이 불가합니다.`
+        });
+      }
+    }
+
+    // 속도(SOG) 이상값 검사 (AIS 수신 미수신 무효값: 1023, 999 등)
+    if (idxMap.sog !== -1) {
+      const sogNum = parseFloat(row[idxMap.sog]);
+      if (isNaN(sogNum)) {
+        sogAnomalyCount++;
+      } else if (sogNum === 1023 || sogNum === 102.3 || sogNum === 999 || sogNum < 0 || sogNum > maxSpeedThreshold) {
+        sogAnomalyCount++;
+        if (rIdx < 20) {
+          issues.push({
+            rowIdx: rowNum,
+            mmsi: mmsiVal || "미상",
+            timestamp: timeVal || "N/A",
+            column: mapping.sog || "속도",
+            value: String(sogNum),
+            issueType: 'LIMIT_EXCEEDED',
+            severity: 'medium',
+            message: `${rowNum}행: 비정상 속도 감지 (${sogNum} kts). AIS 무효 플래그(1023) 또는 한계치(${maxSpeedThreshold} kts)를 초과한 에러 데이터 성격입니다.`
+          });
+        }
+      }
+    }
+
+    // 선수방위(COG) 이상치 검사
+    if (idxMap.cog !== -1) {
+      const cogNum = parseFloat(row[idxMap.cog]);
+      if (isNaN(cogNum)) {
+        cogAnomalyCount++;
+      } else if (cogNum === 3600 || cogNum === 360 || cogNum < 0 || cogNum > 360) {
+        cogAnomalyCount++;
+        if (rIdx < 20) {
+          issues.push({
+            rowIdx: rowNum,
+            mmsi: mmsiVal || "미상",
+            timestamp: timeVal || "N/A",
+            column: mapping.cog || "선수방위",
+            value: String(cogNum),
+            issueType: 'OUT_OF_RANGE',
+            severity: 'low',
+            message: `${rowNum}행: 선수방위(COG) 수치가 정상 범위(0°~360°)를 이탈했습니다 (${cogNum}°).`
+          });
+        }
+      }
+    }
+
+    // 헤딩(Heading) 이상치 검사 (미수신 대표코드 511)
+    if (idxMap.heading !== -1) {
+      const hgNum = parseFloat(row[idxMap.heading]);
+      if (isNaN(hgNum)) {
+        headingAnomalyCount++;
+      } else if (hgNum === 511 || hgNum < 0 || hgNum > 360) {
+        headingAnomalyCount++;
+        if (rIdx < 20) {
+          issues.push({
+            rowIdx: rowNum,
+            mmsi: mmsiVal || "미상",
+            timestamp: timeVal || "N/A",
+            column: mapping.heading || "헤딩",
+            value: String(hgNum),
+            issueType: 'OUT_OF_RANGE',
+            severity: 'low',
+            message: `${rowNum}행: 헤딩 전방 지향각이 미수신 코드(511) 또는 비현실적 범위 값입니다 (${hgNum}°).`
+          });
+        }
+      }
+    }
+
+    // 선박 크기 밸런스 검수
+    if (idxMap.lengthTop !== -1 || idxMap.lengthBottom !== -1 || idxMap.lengthLeft !== -1 || idxMap.lengthRight !== -1) {
+      const t = idxMap.lengthTop !== -1 ? parseFloat(row[idxMap.lengthTop]) || 0 : 0;
+      const b = idxMap.lengthBottom !== -1 ? parseFloat(row[idxMap.lengthBottom]) || 0 : 0;
+      const l = idxMap.lengthLeft !== -1 ? parseFloat(row[idxMap.lengthLeft]) || 0 : 0;
+      const r = idxMap.lengthRight !== -1 ? parseFloat(row[idxMap.lengthRight]) || 0 : 0;
+
+      if ((t > 0 && b === 0) || (l > 0 && r === 0) || t > 300 || b > 300 || l > 100 || r > 100) {
+        sizeAnomalyCount++;
+        if (rIdx < 10) {
+          issues.push({
+            rowIdx: rowNum,
+            mmsi: mmsiVal || "미상",
+            timestamp: timeVal || "N/A",
+            column: "선박 제원 정보",
+            value: `${t}m x ${b}m x ${l}m x ${r}m`,
+            issueType: 'UNREALISTIC',
+            severity: 'low',
+            message: `${rowNum}행: 선박 비대칭 및 유실 제원 폭 발견 (상:${t}m, 하:${b}m, 좌:${l}m, 우:${r}m)`
+          });
+        }
+      }
+    }
+  });
+
+  // 데이터 품질 점수 결정 (감점 방식)
+  let baseScore = 100;
+  if (!isPredictable) {
+    baseScore -= 40; // 위치 미정의 치명타
+  }
+  
+  const issuePenalty = Math.min(30, (issues.filter(i => i.severity === 'high').length * 3) + (issues.filter(i => i.severity === 'medium').length * 1));
+  baseScore -= issuePenalty;
+
+  // 누락 항목 감점
+  const missingTextPenalty = Math.min(15, (missingVesselNameCount / Math.max(1, totalRecords)) * 10 + (missingCallSignCount / Math.max(1, totalRecords)) * 5);
+  baseScore -= missingTextPenalty;
+
+  const qualityScore = Math.max(10, Math.round(baseScore));
+
+  const mappedColumns: { key: string; header: string }[] = [];
+  Object.entries(mapping).forEach(([k, v]) => {
+    if (v) mappedColumns.push({ key: k, header: v });
+  });
+
+  return {
+    isPredictable,
+    totalRecords,
+    totalVessels: uniqueVessels.size,
+    mappedColumns,
+    missingRequiredColumns,
+    qualityScore,
+    issues,
+    missingVesselNameCount,
+    missingCallSignCount,
+    missingImoCount,
+    sogAnomalyCount,
+    cogAnomalyCount,
+    headingAnomalyCount,
+    sizeAnomalyCount
+  };
+}
+
+// 7단계 한글 주석 포함 로컬 분석 Python 코드 템플릿 생성기
+export function generatePythonCode(params: {
+  maxSpeedKts: number;
+  anomalyCofThreshold: number;
+  isPredictable: boolean;
+  mapping: ColumnMapping;
+}): string {
+  const mapStr = JSON.stringify(params.mapping, null, 4);
+
+  return `#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+"""
+================================================================================
+인공지능 기반 산호초 보호 및 해양 오염원 실시간 감시 시스템 - 로컬 데이터 분석 모듈
+================================================================================
+
+본 파이썬 프로그램은 웹 시뮬레이터와 완전히 연동되며, 사용자가 로컬 환경(PC/서버)에서
+대용량 AIS 해양 데이터를 전처리하고 물리 기반/AI 기반 경로를 정밀 탐색할 수 있게 지원합니다.
+
+[실행 가이드]
+$ pip install pandas numpy scikit-learn
+(XGBoost를 선택적으로 사용하려면: $ pip install xgboost)
+
+$ python ais_surveillance_pipeline.py --input data.csv
+"""
+
+import os
+import sys
+import argparse
+import numpy as np
+import pandas as pd
+from datetime import datetime
+
+# -------------------------------------------------------------
+# [ST-1] 컬럼 자동 매핑 정의 및 전처리 파라미터 구성
+# -------------------------------------------------------------
+# 웹 대시보드 상에서 자동 검색한 컬럼 정보와 슬라이더 튜닝값이 자동 바인딩되어 있습니다.
+
+COLUMN_MAPPING = ${mapStr}
+
+MAX_SPEED_THRESHOLD = ${params.maxSpeedKts}     # 비정상 데이터 필터링 최고 속도 (kts)
+COG_CHANGE_THRESHOLD = ${params.anomalyCofThreshold}   # 오염 의심 급선회 기준 각도 (degree)
+
+def load_and_decode_csv(filepath):
+    """
+    한글 공공데이터의 특성을 배려하여 CP949/EUC-KR 및 UTF-8 인코딩을 자동 탐색해 로드합니다.
+    """
+    encodings = ['utf-8', 'cp949', 'euc-kr', 'latin-1']
+    for idx, enc in enumerate(encodings):
+        try:
+            print(f"[진행] {enc} 인코딩 시도 중... ({idx+1}/{len(encodings)})")
+            df = pd.read_csv(filepath, encoding=enc)
+            print(f"[성공] '{enc}' 인코딩으로 데이터 로드를 성공했습니다! (행 수: {len(df)})")
+            return df
+        except UnicodeDecodeError:
+            continue
+        except Exception as e:
+            print(f"[에러] 로딩 실패: {e}")
+            break
+            
+    raise ValueError("지원하는 모든 한글/일반 인코딩으로 CSV를 해독하지 못했습니다. 형식을 확인하세요.")
+
+def analyze_dataset_quality(df):
+    """
+    -------------------------------------------------------------
+    [ST-2] 선박 식별 기형 데이터 및 AIS 불통 누락 정보 진단
+    -------------------------------------------------------------
+    """
+    print("\\n" + "="*50)
+    print(" 2단계: 데이터 세트 품질 및 이상치 리포트")
+    print("="*50)
+    
+    report = {
+        'total_rows': len(df),
+        'missing_gps_coords': 0,
+        'unrealistic_sog': 0,
+        'out_of_range_cog': 0,
+        'out_of_range_heading': 0,
+    }
+    
+    # 1. 위경도 누락 검증
+    lat_col = COLUMN_MAPPING.get('lat')
+    lon_col = COLUMN_MAPPING.get('lon')
+    if lat_col and lon_col:
+        # 공공데이터 등에서 빈값 또는 0으로 채워진 불량 좌표 검수
+        null_coords = df[df[lat_col].isna() | df[lon_col].isna() | (df[lat_col] == 0) | (df[lon_col] == 0)]
+        report['missing_gps_coords'] = len(null_coords)
+        print(f"- 위치 좌표(GPS) 누락 및 0값 위반 건수: {len(null_coords)} 건")
+    else:
+        print("- [주의] 파일에 위도/경도 필드가 누락되어 물리 좌표 분석이 불가능합니다.")
+        
+    # 2. SOG (속도) 이상값 (대표 미수신 플래그 1023 검수)
+    sog_col = COLUMN_MAPPING.get('sog')
+    if sog_col:
+        sog_series = pd.to_numeric(df[sog_col], errors='coerce')
+        anom_sog = df[sog_series.isna() | (sog_series >= 102.3) | (sog_series == 1023) | (sog_series < 0) | (sog_series > MAX_SPEED_THRESHOLD)]
+        report['unrealistic_sog'] = len(anom_sog)
+        print(f"- AIS 수신 불가 플래그(1023) 및 한계속도 초과 건수: {len(anom_sog)} 건")
+        
+    # 3. COG (선수방위)
+    cog_col = COLUMN_MAPPING.get('cog')
+    if cog_col:
+        cog_series = pd.to_numeric(df[cog_col], errors='coerce')
+        anom_cog = df[cog_series.isna() | (cog_series > 360) | (cog_series < 0) | (cog_series == 3600)]
+        report['out_of_range_cog'] = len(anom_cog)
+        print(f"- 선수방위 범위 초과 (0~360 이탈) 건수: {len(anom_cog)} 건")
+        
+    # 4. Heading (헤딩 각도)
+    hd_col = COLUMN_MAPPING.get('heading')
+    if hd_col:
+        hd_series = pd.to_numeric(df[hd_col], errors='coerce')
+        anom_hd = df[hd_series.isna() | (hd_series > 360) | (hd_series < 0) | (hd_series == 511)]
+        report['out_of_range_heading'] = len(anom_hd)
+        print(f"- 헤딩 미수신 플래그(511) 및 정상범위 이탈 건수: {len(anom_hd)} 건")
+        
+    return report
+
+def run_trajectory_forecaster(df):
+    """
+    -------------------------------------------------------------
+    [ST-3] 시계열 지연(Lag) 피처 엔지니어링 및 다이나믹 분석
+    -------------------------------------------------------------
+    위/경도가 존재하는 대상을 추려, 이전 위치(t-1, t-2) 물리 관성 벡터를 통해
+    정상 궤적 예측 시뮬레이션을 수행하고 급선회나 보호구역 침탈을 걸러냅니다.
+    """
+    mmsi_col = COLUMN_MAPPING.get('mmsi')
+    time_col = COLUMN_MAPPING.get('timestamp')
+    lat_col = COLUMN_MAPPING.get('lat')
+    lon_col = COLUMN_MAPPING.get('lon')
+    sog_col = COLUMN_MAPPING.get('sog')
+    cog_col = COLUMN_MAPPING.get('cog')
+
+    print("\\n" + "="*50)
+    print(" 3단계: 시간순 선박 경로 예측 및 이상 궤적 추적 연산")
+    print("="*50)
+
+    # 필수값 결측 정제
+    clean_df = df.dropna(subset=[mmsi_col, time_col, lat_col, lon_col]).copy()
+    try:
+        clean_df[time_col] = pd.to_datetime(clean_df[time_col])
+    except Exception:
+        print("[경고] 시간형식 변환 실패. 일반 문자열 정렬을 적용합니다.")
+        
+    # MMSI 및 시간순 정렬
+    clean_df = clean_df.sort_values(by=[mmsi_col, time_col])
+    
+    # 지연 변수 생성 (t-1, t-2 과거 시점 구하기)
+    clean_df['lat_lag1'] = clean_df.groupby(mmsi_col)[lat_col].shift(1)
+    clean_df['lon_lag1'] = clean_df.groupby(mmsi_col)[lon_col].shift(1)
+    clean_df['lat_lag2'] = clean_df.groupby(mmsi_col)[lat_col].shift(2)
+    clean_df['lon_lag2'] = clean_df.groupby(mmsi_col)[lon_col].shift(2)
+    
+    # -------------------------------------------------------------
+    # [ST-4] 관성 기반 궤적 예측 모델 (물리 보간 알고리즘 적용)
+    # -------------------------------------------------------------
+    # 머신러닝 분석에 필수적인 입력 벡터(t-1 등속 모델) 및 산호초 보호 구역 진입 필터 적용
+    
+    predictions = []
+    anomalies = []
+    
+    # 산호초 보호 구역 중심 경위도 (34.68, 129.04) 기준 반경 계산
+    protect_lat, protect_lon = 34.68, 129.04
+    
+    for i, row in clean_df.iterrows():
+        lat = row[lat_col]
+        lon = row[lon_col]
+        lat_l1 = row['lat_lag1']
+        lon_l1 = row['lon_lag1']
+        lat_l2 = row['lat_lag2']
+        lon_l2 = row['lon_lag2']
+        sog = row[sog_col] if pd.notna(row[sog_col]) else 0
+        cog = row[cog_col] if pd.notna(row[cog_col]) else 0
+        
+        # 예측값 연산 (과거 2개 위치 기반 2차 선형 등가속 운동 예측)
+        if pd.notna(lat_l1) and pd.notna(lon_l1):
+            if pd.notna(lat_l2) and pd.notna(lon_l2):
+                # t-1, t-2 기반 가속 속도 연계 예측
+                pred_lat = lat_l1 + (lat_l1 - lat_l2)
+                pred_lon = lon_l1 + (lon_l1 - lon_l2)
+            else:
+                # t-1 기반 단순 등속 관성 예측
+                pred_lat = lat_l1
+                pred_lon = lon_l1
+                
+            # 유클리드 전방 예측 고장 오차 연산 (오차 m 환산식 단순화)
+            err_dist = np.sqrt((lat - pred_lat)**2 + (lon - pred_lon)**2) * 111320 # 1도당 평균 111km
+            predictions.append((rowNum:=i, pred_lat, pred_lon, err_dist))
+            
+            # 오차 거리 480m 이상 급변경 기동 경보
+            if err_dist > 480:
+                anomalies.append({
+                    'row_idx': i,
+                    'mmsi': row[mmsi_col],
+                    'time': str(row[time_col]),
+                    'type': '위험 기동 이탈',
+                    'message': f"예상 안전 항로에서 {err_dist:.1f}m 급격히 이격된 특이 기동 포착 (오염물 투기 의심)"
+                })
+        else:
+            predictions.append((i, np.nan, np.nan, 0))
+            
+        # -------------------------------------------------------------
+        # [ST-5] 지오펜스(Geofence) 보호 구역 실시간 무단 진입 식별
+        # -------------------------------------------------------------
+        dist_to_reef = np.sqrt((lat - protect_lat)**2 + (lon - protect_lon)**2) * 60 # 해리 근사치
+        if dist_to_reef < 0.12: # 약 220미터 이내 초접근
+            anomalies.append({
+                'row_idx': i,
+                'mmsi': row[mmsi_col],
+                'time': str(row[time_col]),
+                'type': '산호초 침범 위반',
+                'message': "⚠️ 환경 재난: 허가되지 않은 선박이 보호 구역 내측 경계를 과속으로 돌파 진행 중!"
+            })
+            
+    # 데이터 장착 및 로컬 출력
+    predictions_df = pd.DataFrame(predictions, columns=['row_idx', 'pred_lat', 'pred_lon', 'deviation_error_m'])
+    clean_df = clean_df.join(predictions_df.set_index('row_idx'))
+    
+    print(f"- 관성기반 자율 경로 시뮬레이션 완료 (통과 레코드 수: {len(clean_df)}행)")
+    print(f"- 경로 이탈 오염기동 및 경보 위협 건수: {len(anomalies)} 건")
+    
+    if anomalies:
+        print("\\n[보호소 통제 센터 실시간 경보 로그]")
+        for a in anomalies[:5]:
+            print(f" ▶ [{a['type']}] ({a['time']}) MMSI {a['mmsi']}: {a['message']}")
+            
+    return clean_df, anomalies
+
+def main():
+    parser = argparse.ArgumentParser(description="AIS CSV 진단 및 선박 이상값 감시 파이프라인")
+    parser.add_argument('--input', type=str, required=True, help="분석 대상 선박 AIS CSV 파일 경로")
+    parser.add_argument('--output', type=str, default='ais_analysis_report.csv', help="결과를 저장할 CSV 파일 경로")
+    
+    # 파라미터가 비어있어도 디스크 세션 로드로 직접 실행 가능하게 지원
+    args = parser.parse_args(args=None if sys.argv[1:] else ['--input', 'vessel_sample.csv'])
+    
+    if not os.path.exists(args.input):
+        print(f"[오류] 데이터 파일 '{args.input}'이(가) 로컬에 존재하지 않습니다!")
+        print("대체용 샘플 데이터를 임시로 생성 및 분석하여 예시를 출력합니다.")
+        # 간이 샘플 파일 빌딩
+        sample_df = pd.DataFrame({
+            '선박번호': ['440456123']*5,
+            '수신시각': [f"2026-06-23 12:0{idx}:00" for idx in range(5)],
+            '위도': [34.675, 34.678, 34.681, 34.683, 34.685],
+            '경도': [129.032, 129.035, 129.039, 129.041, 129.043],
+            '속도': [12.4, 12.5, 1023, 11.2, 124.5], # 1023 수신불가, 124 kts 기형속도 포함
+            '선수방위': [45.2, 45.4, 46.1, 3600, 47.2]  # 3600 미수신값 포함
+        })
+        sample_df.to_csv('vessel_sample.csv', index=False, encoding='utf-8')
+        args.input = 'vessel_sample.csv'
+
+    # 1. 파일 적재
+    df = load_and_decode_csv(args.input)
+    
+    # 2. 전처리 에러 및 품질 검수
+    analyze_dataset_quality(df)
+    
+    # 3. 경로 추적 시뮬레이션 (위경도 필드가 있을 때 한정)
+    lat_col = COLUMN_MAPPING.get('lat')
+    lon_col = COLUMN_MAPPING.get('lon')
+    
+    if lat_col and lon_col:
+        result_df, warns = run_trajectory_forecaster(df)
+        # -------------------------------------------------------------
+        # [ST-6] 로컬 디스크 통합 저장 및 데이터 검증 마무리
+        # -------------------------------------------------------------
+        result_df.to_csv(args.output, index=False, encoding='utf-8-sig')
+        print(f"\\n[성공] 관제 분석 및 예측이 완료되어 최 종합 결과가 '{args.output}'에 보존되었습니다.")
+    else:
+        print("\\n[종료] 위도와 경도가 발견되지 않아 경로 추적 없이 정적 상태 품질 진단 후 작업을 마칩니다.")
+
+if __name__ == "__main__":
+    main()
+`;
+}
+
+// ============================================================================
+// 테스트용 시연 데이터셋 (원클릭 로드 및 발표 지원)
+// ============================================================================
+
+// 데모 A (항로 예측 및 위험 지오펜스 침탈 완벽 구동형 프리셋)
+export const SAMPLE_A_TRACK: VesselPreset[] = [
   {
-    mmsi: "440123456",
-    name: "일반 화물선 (정상 운항 중)",
-    type: "Commercial Cargo Carrier",
-    description: "정상 해역을 안정적인 속도(14~16kts)와 일정한 침로로 안전하게 운항 중인 컨테이너선입니다.",
+    mmsi: "440123789",
+    name: "한국해양공동선 (연구 조사선)",
+    type: "Oceanographic Vessel",
+    description: "독도 및 제주해역 부근 해양 생태계 조사를 정기 수행하는 조사선입니다. 정상적인 속도로 관측 후 안전 구간으로 복귀하는 무해 경로입니다.",
     points: [
-      { mmsi: "440123456", timestamp: "2026-06-16 12:00:00", lat: 34.524, lon: 128.845, sog: 15.2, cog: 41.5 },
-      { mmsi: "440123456", timestamp: "2026-06-16 12:05:00", lat: 34.542, lon: 128.868, sog: 15.1, cog: 42.0 },
-      { mmsi: "440123456", timestamp: "2026-06-16 12:10:00", lat: 34.561, lon: 128.891, sog: 15.3, cog: 42.1 },
-      { mmsi: "440123456", timestamp: "2026-06-16 12:15:00", lat: 34.579, lon: 128.914, sog: 15.4, cog: 41.8 },
-      { mmsi: "440123456", timestamp: "2026-06-16 12:20:00", lat: 34.598, lon: 128.937, sog: 15.2, cog: 42.3 },
-      { mmsi: "440123456", timestamp: "2026-06-16 12:25:00", lat: 34.616, lon: 128.960, sog: 15.3, cog: 42.5 },
-      { mmsi: "440123456", timestamp: "2026-06-16 12:30:00", lat: 34.635, lon: 128.983, sog: 15.5, cog: 42.2 },
-      { mmsi: "440123456", timestamp: "2026-06-16 12:35:00", lat: 34.653, lon: 129.006, sog: 15.4, cog: 42.0 },
-      { mmsi: "440123456", timestamp: "2026-06-16 12:40:00", lat: 34.671, lon: 129.029, sog: 15.2, cog: 41.9 },
-      { mmsi: "440123456", timestamp: "2026-06-16 12:45:00", lat: 34.690, lon: 129.052, sog: 15.1, cog: 42.4 },
-      { mmsi: "440123456", timestamp: "2026-06-16 12:50:00", lat: 34.708, lon: 129.075, sog: 15.3, cog: 42.8 },
-      { mmsi: "440123456", timestamp: "2026-06-16 12:55:00", lat: 34.726, lon: 129.098, sog: 15.2, cog: 43.0 },
-      { mmsi: "440123456", timestamp: "2026-06-16 13:00:00", lat: 34.745, lon: 129.121, sog: 15.3, cog: 42.7 },
-      { mmsi: "440123456", timestamp: "2026-06-16 13:05:00", lat: 34.763, lon: 129.144, sog: 15.5, cog: 42.5 },
-      { mmsi: "440123456", timestamp: "2026-06-16 13:10:00", lat: 34.781, lon: 129.167, sog: 15.4, cog: 42.1 }
+      {
+        mmsi: "440123789",
+        timestamp: "2026-06-23 12:00:00",
+        lat: 34.612,
+        lon: 128.905,
+        sog: 11.2,
+        cog: 45.2,
+        originalRow: { "선박번호": "440123789", "수신시각": "2026-06-23 12:00:00", "위도": "34.612", "경도": "128.905", "속도": "11.2", "선수방위": "45.2", "선박명": "한국해양공동선" }
+      },
+      {
+        mmsi: "440123789",
+        timestamp: "2026-06-23 12:05:00",
+        lat: 34.621,
+        lon: 128.918,
+        sog: 11.5,
+        cog: 45.5,
+        originalRow: { "선박번호": "440123789", "수신시각": "2026-06-23 12:05:00", "위도": "34.621", "경도": "128.918", "속도": "11.5", "선수방위": "45.5", "선박명": "한국해양공동선" }
+      },
+      {
+        mmsi: "440123789",
+        timestamp: "2026-06-23 12:10:00",
+        lat: 34.630,
+        lon: 128.931,
+        sog: 11.4,
+        cog: 45.6,
+        originalRow: { "선박번호": "440123789", "수신시각": "2026-06-23 12:10:00", "위도": "34.630", "경도": "128.931", "속도": "11.4", "선수방위": "45.6", "선박명": "한국해양공동선" }
+      },
+      {
+        mmsi: "440123789",
+        timestamp: "2026-06-23 12:15:00",
+        lat: 34.639,
+        lon: 128.944,
+        sog: 11.3,
+        cog: 45.3,
+        originalRow: { "선박번호": "440123789", "수신시각": "2026-06-23 12:15:00", "위도": "34.639", "경도": "128.944", "속도": "11.3", "선수방위": "45.3", "선박명": "한국해양공동선" }
+      },
+      {
+        mmsi: "440123789",
+        timestamp: "2026-06-23 12:20:00",
+        lat: 34.648,
+        lon: 128.957,
+        sog: 11.4,
+        cog: 45.4,
+        originalRow: { "선박번호": "440123789", "수신시각": "2026-06-23 12:20:00", "위도": "34.648", "경도": "128.957", "속도": "11.4", "선수방위": "45.4", "선박명": "한국해양공동선" }
+      }
     ]
   },
   {
-    mmsi: "440234567",
-    name: "의심 선박 A (급선회/오염물질 투기 의심)",
-    type: "Chemical Tanker",
-    description: "선박의 비정상적인 회전이나 갑작스러운 급선회가 일어난 상태로 오염물질 무단 유출 등이 전방위적으로 의심되는 경로입니다.",
+    mmsi: "440267812",
+    name: "의심 선박 A (급선회 및 연안 이탈)",
+    type: "Dangerous Vessel A",
+    description: "관찰 도중 1215 분 경과 시점에서 갑작스럽게 예기치 못한 우현 90도 격각 선회를 가하여 해양 오염 자원 유출 의심을 받고 있는 비정상 주행 선박입니다.",
     points: [
-      { mmsi: "440234567", timestamp: "2026-06-16 12:00:00", lat: 34.600, lon: 129.200, sog: 18.0, cog: 78.0 },
-      { mmsi: "440234567", timestamp: "2026-06-16 12:05:00", lat: 34.605, lon: 129.230, sog: 18.1, cog: 78.2 },
-      { mmsi: "440234567", timestamp: "2026-06-16 12:10:00", lat: 34.610, lon: 129.260, sog: 18.2, cog: 77.9 },
-      { mmsi: "440234567", timestamp: "2026-06-16 12:15:00", lat: 34.615, lon: 129.290, sog: 17.9, cog: 78.5 },
-      { mmsi: "440234567", timestamp: "2026-06-16 12:20:00", lat: 34.620, lon: 129.320, sog: 18.0, cog: 78.0 },
-      { mmsi: "440234567", timestamp: "2026-06-16 12:25:00", lat: 34.625, lon: 129.350, sog: 17.8, cog: 78.1 },
-      // Sudden sharp maneuver starts here (cog slips to 180, SOG plummets to 7 kts)
-      { mmsi: "440234567", timestamp: "2026-06-16 12:30:00", lat: 34.612, lon: 129.365, sog: 12.4, cog: 140.0 },
-      { mmsi: "440234567", timestamp: "2026-06-16 12:35:00", lat: 34.582, lon: 129.365, sog: 7.2,  cog: 180.5 },
-      { mmsi: "440234567", timestamp: "2026-06-16 12:40:00", lat: 34.555, lon: 129.364, sog: 6.8,  cog: 181.2 },
-      { mmsi: "440234567", timestamp: "2026-06-16 12:45:00", lat: 34.528, lon: 129.363, sog: 7.0,  cog: 180.0 },
-      { mmsi: "440234567", timestamp: "2026-06-16 12:50:00", lat: 34.501, lon: 129.362, sog: 7.1,  cog: 179.7 }
+      {
+        mmsi: "440267812",
+        timestamp: "2026-06-23 12:00:00",
+        lat: 34.590,
+        lon: 129.130,
+        sog: 14.5,
+        cog: 60.0,
+        originalRow: { "선박번호": "440267812", "수신시각": "2026-06-23 12:00:00", "위도": "34.590", "경도": "129.130", "속도": "14.5", "선수방위": "60.0", "선박명": "의심 선박 A" }
+      },
+      {
+        mmsi: "440267812",
+        timestamp: "2026-06-23 12:05:00",
+        lat: 34.602,
+        lon: 129.155,
+        sog: 14.6,
+        cog: 60.2,
+        originalRow: { "선박번호": "440267812", "수신시각": "2026-06-23 12:05:00", "위도": "34.602", "경도": "129.155", "속도": "14.6", "선수방위": "60.2", "선박명": "의심 선박 A" }
+      },
+      {
+        mmsi: "440267812",
+        timestamp: "2026-06-23 12:10:00",
+        lat: 34.614,
+        lon: 129.180,
+        sog: 14.4,
+        cog: 60.1,
+        originalRow: { "선박번호": "440267812", "수신시각": "2026-06-23 12:10:00", "위도": "34.614", "경도": "129.180", "속도": "14.4", "선수방위": "60.1", "선박명": "의심 선박 A" }
+      },
+      {
+        mmsi: "440267812",
+        timestamp: "2026-06-23 12:15:00",
+        lat: 34.618,
+        lon: 129.215,
+        sog: 11.2,
+        cog: 172.5, // 갑자기 선수방위 대폭 변경 및 감속 (오염 투기 의혹!)
+        originalRow: { "선박번호": "440267812", "수신시각": "2026-06-23 12:15:00", "위도": "34.618", "경도": "129.215", "속도": "11.2", "선수방위": "172.5", "선박명": "의심 선박 A" }
+      },
+      {
+        mmsi: "440267812",
+        timestamp: "2026-06-23 12:20:00",
+        lat: 34.604,
+        lon: 129.220,
+        sog: 9.8,
+        cog: 175.0,
+        originalRow: { "선박번호": "440267812", "수신시각": "2026-06-23 12:20:00", "위도": "34.604", "경도": "129.220", "속도": "9.8", "선수방위": "175.0", "선박명": "의심 선박 A" }
+      }
     ]
   },
   {
-    mmsi: "440345678",
-    name: "Poseidon 7 (Sensor Noise)",
-    type: "LNG Tanker",
-    description: "GPS 센서 에러, 전송 버그 또는 스푸핑으로 인해 특정 시점에 불가능한 좌표 이동 및 비현실적인 속도 분출(SOG 92.5 kts) 기형 노이즈가 유입되어 전처리 필터링이 시급한 사례입니다.",
+    mmsi: "440954123",
+    name: "의심 선박 B (산호초 지오펜스 무단 침탈선)",
+    type: "Dangerous Vessel B",
+    description: "생태 가치가 극상인 '산호초 보호 구역(34.68, 129.04)'에 허가 없이 영내로 급진입하여 지오펜스 실시간 쉘 위반 경보를 격발시킨 소형 고속 어로정입니다.",
     points: [
-      { mmsi: "440345678", timestamp: "2026-06-16 12:00:00", lat: 34.850, lon: 129.100, sog: 12.0, cog: 270.0 },
-      { mmsi: "440345678", timestamp: "2026-06-16 12:05:00", lat: 34.850, lon: 129.080, sog: 12.1, cog: 270.3 },
-      { mmsi: "440345678", timestamp: "2026-06-16 12:10:00", lat: 34.850, lon: 129.060, sog: 11.9, cog: 269.8 },
-      // Extreme noise spike in GPS / speed
-      { mmsi: "440345678", timestamp: "2026-06-16 12:15:00", lat: 35.150, lon: 128.010, sog: 92.5, cog: 112.4 }, // Unrealistic jump
-      { mmsi: "440345678", timestamp: "2026-06-16 12:20:00", lat: 34.850, lon: 129.020, sog: 12.0, cog: 270.1 }, // Normal position resumed
-      { mmsi: "440345678", timestamp: "2026-06-16 12:25:00", lat: 34.850, lon: 129.000, sog: 12.2, cog: 270.5 },
-      { mmsi: "440345678", timestamp: "2026-06-16 12:30:00", lat: 34.850, lon: 128.980, sog: 12.1, cog: 270.0 }
-    ]
-  },
-  {
-    mmsi: "440456789",
-    name: "의심 선박 B (산호초 보호구역 무단 진입)",
-    type: "Fishing Boat",
-    description: "생태학적으로 민감한 산호초 보호 구역(위험 지역 GEOFENCE) 내부로 무단 진입 및 가속 행위가 감지되었습니다.",
-    points: [
-      { mmsi: "440456789", timestamp: "2026-06-16 12:00:00", lat: 34.880, lon: 129.450, sog: 6.2, cog: 135.0 },
-      { mmsi: "440456789", timestamp: "2026-06-16 12:05:00", lat: 34.868, lon: 129.462, sog: 6.4, cog: 134.8 },
-      { mmsi: "440456789", timestamp: "2026-06-16 12:10:00", lat: 34.856, lon: 129.474, sog: 6.3, cog: 135.2 },
-      // Direct heading towards Coastal Guard Restricted Polygon centered around (34.82, 129.51)
-      { mmsi: "440456789", timestamp: "2026-06-16 12:15:00", lat: 34.844, lon: 129.486, sog: 8.5, cog: 135.0 },
-      { mmsi: "440456789", timestamp: "2026-06-16 12:20:00", lat: 34.832, lon: 129.498, sog: 11.2, cog: 135.5 }, // Trespassing geofence
-      { mmsi: "440456789", timestamp: "2026-06-16 12:25:00", lat: 34.820, lon: 129.510, sog: 13.0, cog: 135.0 }, // Inside deep warning zone
-      { mmsi: "440456789", timestamp: "2026-06-16 12:30:00", lat: 34.808, lon: 129.522, sog: 13.5, cog: 136.0 },
-      { mmsi: "440456789", timestamp: "2026-06-16 12:35:00", lat: 34.796, lon: 129.534, sog: 13.2, cog: 134.9 }
+      {
+        mmsi: "440954123",
+        timestamp: "2026-06-23 12:00:00",
+        lat: 34.670,
+        lon: 129.015,
+        sog: 18.2,
+        cog: 50.0,
+        originalRow: { "선박번호": "440954123", "수신시각": "2026-06-23 12:00:00", "위도": "34.670", "경도": "129.015", "속도": "18.2", "선수방위": "50.0", "선박명": "의심 선박 B" }
+      },
+      {
+        mmsi: "440954123",
+        timestamp: "2026-06-23 12:05:00",
+        lat: 34.675,
+        lon: 129.025,
+        sog: 18.5,
+        cog: 50.1,
+        originalRow: { "선박번호": "440954123", "수신시각": "2026-06-23 12:05:00", "위도": "34.675", "경도": "129.025", "속도": "18.5", "선수방위": "50.1", "선박명": "의심 선박 B" }
+      },
+      {
+        mmsi: "440954123",
+        timestamp: "2026-06-23 12:10:00",
+        lat: 34.680,
+        lon: 129.038, // 산호초 중심 (34.68, 129.04) 에 초근접! (침입 개시됨)
+        sog: 19.1,
+        cog: 50.2,
+        originalRow: { "선박번호": "440954123", "수신시각": "2026-06-23 12:10:00", "위도": "34.680", "경도": "129.038", "속도": "19.1", "선수방위": "50.2", "선박명": "의심 선박 B" }
+      },
+      {
+        mmsi: "440954123",
+        timestamp: "2026-06-23 12:15:00",
+        lat: 34.685,
+        lon: 129.049,
+        sog: 18.8,
+        cog: 50.0,
+        originalRow: { "선박번호": "440954123", "수신시각": "2026-06-23 12:15:00", "위도": "34.685", "경도": "129.049", "속도": "18.8", "선수방위": "50.0", "선박명": "의심 선박 B" }
+      },
+      {
+        mmsi: "440954123",
+        timestamp: "2026-06-23 12:20:00",
+        lat: 34.690,
+        lon: 129.060,
+        sog: 18.0,
+        cog: 49.8,
+        originalRow: { "선박번호": "440954123", "수신시각": "2026-06-23 12:20:00", "위도": "34.690", "경도": "129.060", "속도": "18.0", "선수방위": "49.8", "선박명": "의심 선박 B" }
+      }
     ]
   }
 ];
 
-// Helper to convert objects collection into clean CSV formatted string
-export function jsonToCsv(points: AISPoint[]): string {
-  const headers = "MMSI,Timestamp,Latitude,Longitude,SOG,COG";
-  const rows = points.map(p => `${p.mmsi},${p.timestamp},${p.lat},${p.lon},${p.sog},${p.cog}`);
-  return [headers, ...rows].join("\n");
-}
-
-// Custom parser for uploaded/pasted CSV
-export function parseCsv(csvText: string): AISPoint[] {
-  const lines = csvText.split("\n");
-  const result: AISPoint[] = [];
-  
-  // Find which column name matches what
-  if (lines.length < 2) return [];
-  
-  const header = lines[0].toLowerCase().replace(/"/g, '').split(",");
-  const mmsiIdx = header.findIndex(h => h.includes("mmsi"));
-  const timeIdx = header.findIndex(h => h.includes("time") || h.includes("stamp"));
-  const latIdx = header.findIndex(h => h.includes("lat"));
-  const lonIdx = header.findIndex(h => h.includes("lon"));
-  const sogIdx = header.findIndex(h => h.includes("sog") || h.includes("speed"));
-  const cogIdx = header.findIndex(h => h.includes("cog") || h.includes("course"));
-  
-  // Fallback defaults if structure is standard: 0=MMSI, 1=Timestamp, 2=Lat, 3=Lon, 4=SOG, 5=COG
-  const finalMmsiIdx = mmsiIdx !== -1 ? mmsiIdx : 0;
-  const finalTimeIdx = timeIdx !== -1 ? timeIdx : 1;
-  const finalLatIdx = latIdx !== -1 ? latIdx : 2;
-  const finalLonIdx = lonIdx !== -1 ? lonIdx : 3;
-  const finalSogIdx = sogIdx !== -1 ? sogIdx : 4;
-  const finalCogIdx = cogIdx !== -1 ? cogIdx : 5;
-  
-  for (let i = 1; i < lines.length; i++) {
-    const rawLine = lines[i].trim();
-    if (!rawLine) continue;
-    const cols = rawLine.split(",").map(c => c.replace(/"/g, '').trim());
-    if (cols.length < 4) continue;
-    
-    const latVal = parseFloat(cols[finalLatIdx]);
-    const lonVal = parseFloat(cols[finalLonIdx]);
-    if (isNaN(latVal) || isNaN(lonVal)) continue;
-    
-    result.push({
-      mmsi: cols[finalMmsiIdx] || "UNKNOWN",
-      timestamp: cols[finalTimeIdx] || new Date().toISOString().replace('T', ' ').substring(0, 19),
-      lat: latVal,
-      lon: lonVal,
-      sog: parseFloat(cols[finalSogIdx]) || 0,
-      cog: parseFloat(cols[finalCogIdx]) || 0
-    });
-  }
-  return result;
-}
-
-// Dynamic Python code generation based on UI sliders or configurations
-export function generatePythonCode(config: {
-  maxSpeedKts: number;
-  lagSteps: number;
-  xgboostEstimators: number;
-  anomalyCofThreshold: number;
-}): string {
-  return `import pandas as pd
-import numpy as np
-from datetime import datetime
-import xgboost as xgb
-from sklearn.model_selection import train_test_split
-from sklearn.metrics import mean_squared_error, mean_absolute_error
-
-"""
-========================================================================
-AIS 선박 경로 예측 및 이상 기동 실시간 탐지 파이프라인 (XGBoost)
-========================================================================
-- 작성목적: AIS 원천 데이터를 로드, 정련, 파생 변수를 고속으로 생성하고,
-           XGBoost를 사용하여 차기 위치 예측 및 급격한 거동 패턴 감시 수행.
-========================================================================
-"""
-
-# -------------------------------------------------------------
-# [ST-1] 데이터 로드 (CSV 파일 문자열 주입 또는 로컬 파일 읽기 가능)
-# -------------------------------------------------------------
-def load_and_init_data(csv_filepath_or_buffer):
-    """
-    AIS 정형 데이터를 Pandas DataFrame으로 불러옵니다.
-    """
-    print("[1] AIS 원천 데이터를 정하민 정형 레이아웃으로 로드하고 있습니다...")
-    # CSV를 읽고 컬럼 전처리 수행
-    df = pd.read_csv(csv_filepath_or_buffer)
-    
-    # 컬럼 공백 제거 및 표준화
-    df.columns = [col.strip() for col in df.columns]
-    
-    # 시간 정보를 datetime 타입으로 파싱 후 인덱스/시간순 정렬 대비
-    df['Timestamp'] = pd.to_datetime(df['Timestamp'])
-    return df
-
-
-# -------------------------------------------------------------
-# [ST-2] 데이터 정제 및 이상치 처리 (Preprocessing)
-# -------------------------------------------------------------
-def preprocess_ais_data(df, max_speed_threshold=${config.maxSpeedKts}):
-    """
-    1. MMSI 및 중요 좌표계 결측치 소거
-    2. 중복 행 제거
-    3. 비현실적 이상 속력(예: SOG > ${config.maxSpeedKts} knots) 필터링 (센서 노이즈)
-    4. MMSI별 / Timestamp(시계열) 오름차순 정렬
-    """
-    print("[2] 데이터 클렌징 및 이상 센서 노이즈 필터링 진행 중...")
-    initial_count = len(df)
-    
-    # 필수 좌표계 결측 검증
-    df = df.dropna(subset=['MMSI', 'Latitude', 'Longitude'])
-    
-    # 정제 규칙 1: SOG(속도 Over Ground) 한계 임계값 초과 체크
-    # 상선 속도가 ${config.maxSpeedKts}노트 이상인 값은 GPS 스푸핑 및 전송 불안 노이즈로 간주하고 필터링합니다.
-    df = df[df['SOG'] <= max_speed_threshold]
-    
-    # MMSI 및 시간 기준 정렬
-    df = df.sort_values(by=['MMSI', 'Timestamp']).reset_index(drop=True)
-    
-    cleaned_count = len(df)
-    print(f" -> 완료: 총 {initial_count}개 행 중 {initial_count - cleaned_count}개의 이상/노이즈 레코드 소거 완료.")
-    return df
-
-
-# -------------------------------------------------------------
-# [ST-3] 시계열 피처 엔지니어링 (Lag Features & Changes)
-# -------------------------------------------------------------
-def engineer_ais_features(df, lag_steps=${config.lagSteps}):
-    """
-    과거 시점(t-1, t-2) 위산/경도 차이를 계산하여 파생 피처를 생산합니다.
-    - lat_lag1, lon_lag1 : 직전 시점(t-1) 위도 및 경도
-    - lat_lag2, lon_lag2 : 전전 시점(t-2) 위도 및 경도
-    - sog_diff : 최근 속도 가속화 변화량
-    - cog_diff : 최근 방향(행선 침로) 꺾임 변화량
-    """
-    print(f"[3] 피처 엔지니어링 수행 중 (Window Lag: {lag_steps} 시점)...")
-    
-    # MMSI 단위로 시계열 그룹화를 수행하여 각 윈도우 슬라이스 계산
-    grouped = df.groupby('MMSI')
-    
-    # 과거 수치 반영 (t-1, t-2 위경도 지연값 생성)
-    for shift_i in range(1, lag_steps + 1):
-        df[f'lat_lag{shift_i}'] = grouped['Latitude'].shift(shift_i)
-        df[f'lon_lag{shift_i}'] = grouped['Longitude'].shift(shift_i)
-        df[f'sog_lag{shift_i}'] = grouped['SOG'].shift(shift_i)
-        df[f'cog_lag{shift_i}'] = grouped['COG'].shift(shift_i)
-
-    # 15분 이내 시간 간격 가정을 통한 급변량 도출 (직전 속력 및 침로의 대수적 차이값)
-    df['sog_diff'] = df['SOG'] - df['sog_lag1']
-    
-    # 침로 COG는 360도 평면 순환이므로 방향 차이의 주기성을 고려하여 보정 (-180 ~ +180)
-    cog_raw_diff = df['COG'] - df['cog_lag1']
-    df['cog_diff'] = (cog_raw_diff + 180) % 360 - 180
-    
-    # 다음 위치 예측을 위해 Target 변수(t+1 시점의 위경도)도 사전에 생성해 둡니다
-    df['target_lat'] = grouped['Latitude'].shift(-1)
-    df['target_lon'] = grouped['Longitude'].shift(-1)
-    
-    # Lag 변수들 및 Target 생성 과정에서 확보하지 못한 결측 시작/종료 부분 제거
-    clean_featured_df = df.dropna().copy()
-    print(f" -> 피처 엔지니어링 결과 생성된 피처 수: {len(clean_featured_df.columns)}개 적용됨.")
-    return clean_featured_df
-
-
-# -------------------------------------------------------------
-# [ST-4] XGBoost 머신러닝 모델 학습 및 예측
-# -------------------------------------------------------------
-def train_prediction_model(df):
-    """
-    선박의 현재 물리 상태와 과거 Lag 이력 피처들을 기반으로 차기 좌표(Target Lat, Target Lon)를 예측하는
-    독립적인 XGBoost Regressor 모델을 구동하고 검증합니다.
-    """
-    print("[4] 최적화된 XGBoost 예측 모델 학습 및 차수 검증 진행 중...")
-    
-    # 입력 모델 예측에 활용할 Feature 리스트 명시
-    feature_cols = [
-        'Latitude', 'Longitude', 'SOG', 'COG',
-        'lat_lag1', 'lon_lag1', 'lat_lag2', 'lon_lag2',
-        'sog_lag1', 'cog_lag1', 'sog_diff', 'cog_diff'
-    ]
-    
-    X = df[feature_cols]
-    y_lat = df['target_lat']
-    y_lon = df['target_lon']
-    
-    # Train / Test Split
-    X_train, X_test, y_train_lat, y_test_lat = train_test_split(X, y_lat, test_size=0.2, random_state=42)
-    _, _, y_train_lon, y_test_lon = train_test_split(X, y_lon, test_size=0.2, random_state=42)
-    
-    # 1. 위도 예측 XGBoost Regressor
-    model_lat = xgb.XGBRegressor(
-        n_estimators=${config.xgboostEstimators},
-        learning_rate=0.08,
-        max_depth=5,
-        random_state=42
-    )
-    model_lat.fit(X_train, y_train_lat)
-    
-    # 2. 경도 예측 XGBoost Regressor
-    model_lon = xgb.XGBRegressor(
-        n_estimators=${config.xgboostEstimators},
-        learning_rate=0.08,
-        max_depth=5,
-        random_state=42
-    )
-    model_lon.fit(X_train, y_train_lon)
-    
-    # 성능 검증 예측
-    pred_lat = model_lat.predict(X_test)
-    pred_lon = model_lon.predict(X_test)
-    
-    rmse_lat = np.sqrt(mean_squared_error(y_test_lat, pred_lat))
-    rmse_lon = np.sqrt(mean_squared_error(y_test_lon, pred_lon))
-    
-    print(f" -> [검증 성능] 위도 예측 RMSE: {rmse_lat:.6f} 도")
-    print(f" -> [검증 성능] 경도 예측 RMSE: {rmse_lon:.6f} 도")
-    
-    return model_lat, model_lon, feature_cols
-
-
-# -------------------------------------------------------------
-# [ST-5] 지능형 이상 운항 감시 모니터링 로직 (Anomaly Monitor)
-# -------------------------------------------------------------
-def monitor_abnormal_behavior(df, model_lat, model_lon, feature_cols):
-    """
-    예측 위경도 평면과 전처리 도출 이상 패턴을 비교하여 4가지 감시 규칙으로 실시간 이상 징후를 분류합니다.
-    
-    1. 속도 이상(SOG_SUDDEN): 속도가 단시간 내 비정상 감속 혹은 급변경
-    2. 조타 방향 급변(COG_SUDDEN): 훈련/충돌 회피 비정상 급선회 감지 (COG 변동 > 45도 초과)
-    3. 예측 경로 이탈(DEVIATION_HIGH): XGBoost 예측 값 대비 실제 도달 거리가 유클리드 임계값 초과
-    """
-    print("[5] 파이썬 실시간 룰 기반 + ML 차수 이탈 이상 기동 모니터링 수행...")
-    
-    results = df.copy()
-    
-    # XGBoost 예측값 대입
-    results['predicted_lat'] = model_lat.predict(results[feature_cols])
-    results['predicted_lon'] = model_lon.predict(results[feature_cols])
-    
-    # 실제 도달 거리 편차 계산
-    lat_err = results['target_lat'] - results['predicted_lat']
-    lon_err = results['target_lon'] - results['predicted_lon']
-    results['prediction_error_dist'] = np.sqrt(lat_err**2 + lon_err**2) * 111.32  # 도 단위 -> KM 근사치 변환
-    
-    anomalies = []
-    for idx, row in results.iterrows():
-        # 규칙 1: SOG_SUDDEN
-        if abs(row['sog_diff']) > 6.0:  # 5분만에 6노트 이상 감속/가속
-            anomalies.append({
-                'Timestamp': str(row['Timestamp']),
-                'MMSI': int(row['MMSI']),
-                'Latitude': row['Latitude'],
-                'Longitude': row['Longitude'],
-                'Anomaly_Type': 'SOG_SUDDEN_CHANGE',
-                'Status': 'CRITICAL',
-                'Detail': f"급격한 기동 속도 변동 (변화량: {row['sog_diff']:.1f} kts)"
-            })
-            
-        # 규칙 2: COG_SUDDEN
-        if abs(row['cog_diff']) > ${config.anomalyCofThreshold}.0:  # 5분내 침로가 ${config.anomalyCofThreshold}도 이상 변경
-            anomalies.append({
-                'Timestamp': str(row['Timestamp']),
-                'MMSI': int(row['MMSI']),
-                'Latitude': row['Latitude'],
-                'Longitude': row['Longitude'],
-                'Anomaly_Type': 'COG_SUDDEN_TURN',
-                'Status': 'WARNING',
-                'Detail': f"지정 임계치 초과 급선회 감지 (변위 각도: {row['cog_diff']:.1f}도)"
-            })
-            
-        # 규칙 3: DEVIATION_HIGH (ML 모델이 배가 갈 것으로 상정한 경로에서 어긋난 주행을 할 때)
-        if row['prediction_error_dist'] > 0.45:  # 450m 이상 예측 모델 예상 궤적 이탈
-            anomalies.append({
-                'Timestamp': str(row['Timestamp']),
-                'MMSI': int(row['MMSI']),
-                'Latitude': row['Latitude'],
-                'Longitude': row['Longitude'],
-                'Anomaly_Type': 'PATH_DEVIATION_HIGH',
-                'Status': 'CRITICAL',
-                'Detail': f"XGBoost 예측 경로 오차 궤적 이탈 (이탈거리: {row['prediction_error_dist']*1000:.1f}m)"
-            })
-            
-    anomalies_df = pd.DataFrame(anomalies)
-    return results, anomalies_df
-
-
-# -------------------------------------------------------------
-# [ST-6] 로컬 메인 시뮬레이션 테스트 실행기
-# -------------------------------------------------------------
-if __name__ == "__main__":
-    # 가상의 샘플 AIS 데이터 메모리 버퍼 생성 (사용자 주입과 동일한 규격)
-    sample_csv_data = \"\"\"MMSI,Timestamp,Latitude,Longitude,SOG,COG
-440987654,2026-06-16 12:00:00,34.524,128.845,15.2,41.5
-440987654,2026-06-16 12:05:00,34.542,128.868,15.1,42.0
-440987654,2026-06-16 12:10:00,34.561,128.891,15.3,42.1
-440987654,2026-06-16 12:15:00,34.579,128.914,15.4,32.4
-440987654,2026-06-16 12:20:00,34.598,128.937,92.5,42.3 # 노이즈 포인트 유입
-440987654,2026-06-16 12:25:00,34.616,128.960,15.3,42.5
-440987654,2026-06-16 12:30:00,34.635,128.983,15.5,42.2
-440987654,2026-06-16 12:35:00,34.653,129.006,5.1,130.0 # 갑작스러운 속도 격감 및 회전
-440987654,2026-06-16 12:40:00,34.671,129.029,5.0,131.0
-\"\"\"
-    
-    import io
-    # 1. 원천 데이터 취득
-    raw_df = load_and_init_data(io.StringIO(sample_csv_data))
-    
-    # 2. 전처리 정제 구동
-    cleaned_df = preprocess_ais_data(raw_df)
-    
-    # 3. 피처 지연변수 자동 구축
-    featured_df = engineer_ais_features(cleaned_df)
-    
-    # 4. XGBoost 모델 피팅
-    md_lat, md_lon, f_cols = train_prediction_model(featured_df)
-    
-    # 5. 이상 기동 실시간 탐지 결과 집계
-    predicted_full, anomaly_summary = monitor_abnormal_behavior(featured_df, md_lat, md_lon, f_cols)
-    
-    print("\\n==================================================")
-    print("   [분석 피드백 리포트 - 최종 탐지 요약]")
-    print("==================================================")
-    if len(anomaly_summary) > 0:
-        print(anomaly_summary.to_string(index=False))
-    else:
-        print("정상 안전 운항 상태입니다. 어떠한 이상 거동 기동도 탐지되지 않았습니다.")
-    print("==================================================\\n")
-`;
-}
+// 품질 진단 및 이탈 탐색 대시보드 시뮬레이터 백업 예시용 (모드 B: 경위도 불포함 한국 제원 공공데이터용)
+export const SAMPLE_B_STRUCT_ONLY: Record<string, string>[] = [
+  { "선박번호": "44101", "선박명": "남해스타호 (어선)", "선박식별번호(IMO)": "120556", "호출부호": "DT3981", "선박길이_상": "15", "선박길이_하": "15", "선박길이_좌": "4", "선박길이_우": "0", "수신시각": "2026-06-23 09:00:00", "속도": "9.5", "선수방위": "270", "헤딩": "511" },
+  { "선박번호": "44101", "선박명": "남해스타호 (어선)", "선박식별번호(IMO)": "120556", "호출부호": "DT3981", "선박길이_상": "15", "선박길이_하": "15", "선박길이_좌": "4", "선박길이_우": "4", "수신시각": "2026-06-23 09:15:00", "속도": "1023", "선수방위": "270", "헤딩": "268" }, // 1023 이상속도오차
+  { "선박번호": "44102", "선박명": "골든크라운호 (화물선)", "선박식별번호(IMO)": "0", "호출부호": "", "선박길이_상": "90", "선박길이_하": "0", "선박길이_좌": "14", "선박길이_우": "14", "수신시각": "2026-06-23 09:05:00", "속도": "12.5", "선수방위": "180", "헤딩": "180" }, // IMO=0, 호출부호 누락, 길이 하 미기재로 비대칭
+  { "선박번호": "44103", "선박명": "", "선박식별번호(IMO)": "955102", "호출부호": "HQ9122", "선박길이_상": "210", "선박길이_하": "210", "선박길이_좌": "32", "선박길이_우": "32", "수신시각": "2026-06-23 09:12:00", "속도": "58.2", "선수방위": "3600", "헤딩": "34" }, // 선명 누락, COG=3600 이상치, 속도=58노트(비정상 과속)
+  { "선박번호": "44104", "선박명": "오션블루호 (여객선)", "선박식별번호(IMO)": "885102", "호출부호": "OB1203", "선박길이_상": "45", "선박길이_하": "45", "선박길이_좌": "8", "선박길이_우": "8", "수신시각": "2026-06-23 09:20:00", "속도": "18.2", "선수방위": "115", "헤딩": "115" },
+  { "선박번호": "44105", "선박명": "천지해양6호 (유조선)", "선박식별번호(IMO)": "901123", "호출부호": "CJ667", "선박길이_상": "110", "선박길이_하": "110", "선박길이_좌": "18", "선박길이_우": "18", "수신시각": "2026-06-23 09:30:00", "속도": "-5.5", "선수방위": "50", "헤딩": "-10" } // 속도 음수, 헤딩 음수 이상치
+];

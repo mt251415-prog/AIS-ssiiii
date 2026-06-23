@@ -1,6 +1,6 @@
 {
-  "name": "AIS Vessel path predictor & anomaly monitor",
-  "description": "An interactive workspace for AIS vessel path prediction and anomaly monitoring. Includes CSV upload/generation, path mapping, step-by-step feature engineering, LightGBM/XGBoost simulation, and Python production pipeline export.",
+  "name": "AIS CSV 진단 및 선박 이상값 감시 시뮬레이터",
+  "description": "사용자가 업로드한 선박 AIS CSV 파일의 품질을 분석하고, 위경도 좌표 존재 여부에 따라 최적의 항로 예측 시뮬레이션(모드 A) 또는 데이터 이상값 및 품질 감지(모드 B)를 수행하는 고등 해양 관제 시뮬레이터입니다.",
   "requestFramePermissions": [],
   "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
 }

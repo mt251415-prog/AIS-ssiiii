@@ -3,9 +3,32 @@ export interface AISPoint {
   timestamp: string;
   lat: number;
   lon: number;
-  sog: number; // Speed Over Ground (knots)
-  cog: number; // Course Over Ground (degrees)
-  isValid?: boolean;
+  sog: number; // Speed (knots)
+  cog: number; // Course (degrees)
+  heading?: number; // Heading (degrees)
+  vesselName?: string;
+  callSign?: string;
+  lengthTop?: number;
+  lengthBottom?: number;
+  lengthLeft?: number;
+  lengthRight?: number;
+  originalRow: Record<string, string>;
+}
+
+export interface ColumnMapping {
+  mmsi: string | null;
+  timestamp: string | null;
+  lat: string | null;
+  lon: string | null;
+  sog: string | null;
+  cog: string | null;
+  heading: string | null;
+  vesselName: string | null;
+  callSign: string | null;
+  lengthTop: string | null;
+  lengthBottom: string | null;
+  lengthLeft: string | null;
+  lengthRight: string | null;
 }
 
 export interface PreparedFeature {
@@ -15,14 +38,13 @@ export interface PreparedFeature {
   lon: number;
   sog: number;
   cog: number;
+  heading?: number;
   lat_lag1: number | null;
   lon_lag1: number | null;
   lat_lag2: number | null;
   lon_lag2: number | null;
-  sog_lag1: number | null;
   sog_diff: number | null;
   cog_diff: number | null;
-  distance_from_lag: number | null; // in km or deg units
 }
 
 export interface PredictionResult {
@@ -34,14 +56,32 @@ export interface PredictionResult {
   error_distance_m: number;
 }
 
-export interface AnomalyRecord {
-  timestamp: string;
+export interface QualityIssue {
+  rowIdx: number;
   mmsi: string;
-  lat: number;
-  lon: number;
-  type: 'SOG_SUDDEN' | 'COG_SUDDEN' | 'DEVIATION_HIGH' | 'GEOFENCE_VIOLATION' | 'NOISE_FILTERED' | '위험 구역 항로 이탈';
+  timestamp: string;
+  column: string;
+  value: string;
+  issueType: 'MISSING' | 'LIMIT_EXCEEDED' | 'UNREALISTIC' | 'ABSENT_COORDINATE' | 'OUT_OF_RANGE';
   severity: 'low' | 'medium' | 'high';
   message: string;
+}
+
+export interface DiagnosticResult {
+  isPredictable: boolean;
+  totalRecords: number;
+  totalVessels: number;
+  mappedColumns: { key: string; header: string }[];
+  missingRequiredColumns: string[];
+  qualityScore: number;
+  issues: QualityIssue[];
+  missingVesselNameCount: number;
+  missingCallSignCount: number;
+  missingImoCount: number;
+  sogAnomalyCount: number;
+  cogAnomalyCount: number;
+  headingAnomalyCount: number;
+  sizeAnomalyCount: number;
 }
 
 export interface VesselPreset {
@@ -49,5 +89,13 @@ export interface VesselPreset {
   name: string;
   type: string;
   description: string;
-  points: AISPoint[];
+  points: {
+    mmsi: string;
+    timestamp: string;
+    lat: number;
+    lon: number;
+    sog: number;
+    cog: number;
+    originalRow: Record<string, string>;
+  }[];
 }

@@ -1,122 +1,389 @@
-import React, { useState, useMemo, useRef, useEffect } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import { 
-  Ship, 
-  Map as MapIcon, 
-  Database, 
-  Cpu, 
-  FileCode, 
   Upload, 
+  FileCheck, 
+  AlertTriangle, 
   Play, 
   Pause, 
   RotateCcw, 
-  TrendingUp, 
-  AlertTriangle, 
-  Trash2, 
-  Sliders, 
-  CheckCircle, 
+  Terminal, 
+  Settings, 
+  LayoutDashboard, 
+  Code, 
+  Download, 
   Info, 
+  Copy, 
+  Check, 
+  Database, 
   Compass, 
-  Navigation,
-  Globe,
-  ChevronRight,
-  Sparkles,
-  FileText,
-  Copy,
-  PlusCircle,
+  Activity, 
+  Sliders, 
+  Eye, 
+  HelpCircle,
   Clock,
-  Skull
+  Shield,
+  LifeBuoy
 } from 'lucide-react';
-import { VESSEL_PRESETS, jsonToCsv, parseCsv } from './data';
-import { AISPoint, PreparedFeature, PredictionResult, AnomalyRecord, VesselPreset } from './types';
+import { AISPoint, ColumnMapping, DiagnosticResult, QualityIssue, PreparedFeature, PredictionResult } from './types';
+import { parseCsv, autoDetectColumns, performDiagnostic, generatePythonCode, SAMPLE_A_TRACK, SAMPLE_B_STRUCT_ONLY, jsonToCsv } from './data';
 
 export default function App() {
-  // Config parameters controlled by users (re-computes ML & rules in real-time!)
+  // 상태 관리
+  const [csvText, setCsvText] = useState<string>('');
+  const [headers, setHeaders] = useState<string[]>([]);
+  const [parsedRows, setParsedRows] = useState<string[][]>([]);
+  const [columnMapping, setColumnMapping] = useState<ColumnMapping>({
+    mmsi: null, timestamp: null, lat: null, lon: null, sog: null, cog: null, heading: null,
+    vesselName: null, callSign: null, lengthTop: null, lengthBottom: null, lengthLeft: null, lengthRight: null
+  });
+  const [encoding, setEncoding] = useState<string>('AUTO');
+  const [isDragging, setIsDragging] = useState<boolean>(false);
+  const [fileName, setFileName] = useState<string>('');
+  
+  // 제어 파라미터 슬라이더
   const [maxSpeedKts, setMaxSpeedKts] = useState<number>(40);
-  const [lagSteps, setLagSteps] = useState<number>(2);
-  const [xgboostEstimators, setXgboostEstimators] = useState<number>(100);
   const [anomalyCofThreshold, setAnomalyCofThreshold] = useState<number>(45);
   
-  // Custom Data state
-  const [selectedPresetMmsi, setSelectedPresetMmsi] = useState<string>("440123456");
-  const [customCsvText, setCustomCsvText] = useState<string>("");
-  const [useCustomData, setUseCustomData] = useState<boolean>(false);
-  const [copiedCodeIndex, setCopiedCodeIndex] = useState<string | null>(null);
+  // 진단 결과
+  const [diagnostic, setDiagnostic] = useState<DiagnosticResult | null>(null);
   
-  // Radar/GIS Plotter Interaction state
-  const [zoomLevel, setZoomLevel] = useState<number>(1.2);
-  const [panOffset, setPanOffset] = useState<{ x: number; y: number }>({ x: 0, y: 0 });
-  const [hoveredPoint, setHoveredPoint] = useState<(AISPoint & { index: number; targetIdx?: number }) | null>(null);
-  const [activeTab, setActiveTab] = useState<'radar' | 'features'>('radar');
-  
-  // Map Layer Toggles
+  // 모드 A전용 상태 (항로 예측 및 시뮬레이션용)
+  const [selectedMmsi, setSelectedMmsi] = useState<string>('');
+  const [simulationPoints, setSimulationPoints] = useState<AISPoint[]>([]);
+  const [predictions, setPredictions] = useState<PredictionResult[]>([]);
+  const [currentPlayIdx, setCurrentPlayIdx] = useState<number>(0);
+  const [isPlaying, setIsPlaying] = useState<boolean>(false);
+  const [playSpeed, setPlaySpeed] = useState<number>(1000); // ms
   const [showRestrictedZone, setShowRestrictedZone] = useState<boolean>(true);
   const [showPredictedPath, setShowPredictedPath] = useState<boolean>(true);
-  const [showRawDottedLine, setShowRawDottedLine] = useState<boolean>(true);
-  const [mapCursorLatLng, setMapCursorLatLng] = useState<{ lat: number; lon: number } | null>(null);
+  const [showGpsNoise, setShowGpsNoise] = useState<boolean>(true);
+  const [viewport, setViewport] = useState({ scale: 1, x: 0, y: 0 });
+  const [dragStart, setDragStart] = useState<{ x: number; y: number } | null>(null);
+  const mapRef = useRef<HTMLDivElement>(null);
 
-  // Playback Animation States
-  const [isAnimating, setIsAnimating] = useState<boolean>(false);
-  const [currentPlayIdx, setCurrentPlayIdx] = useState<number>(0);
-  const [playbackSpeed, setPlaybackSpeed] = useState<number>(1); // ms multiplier
+  // 현재 탭 ("dashboard" | "code")
+  const [activeTab, setActiveTab] = useState<'dashboard' | 'code'>('dashboard');
+  
+  // 콘솔 로그 수집
+  const [consoleLogs, setConsoleLogs] = useState<string[]>([]);
+  const [copiedCode, setCopiedCode] = useState<boolean>(false);
 
-  // Toast / System Audit logs
-  const [systemLogs, setSystemLogs] = useState<string[]>(["[이벤트] AIS 감시 모니터링 시스템 부팅 완료 - 34°N, 129°E"]);
+  // 실시간 타이머
+  const [currentTimeStr, setCurrentTimeStr] = useState<string>('');
 
-  // Grab active vessel dataset
-  const currentVesselData = useMemo(() => {
-    if (useCustomData) {
-      const parsed = parseCsv(customCsvText);
-      return {
-        mmsi: "CUSTOM",
-        name: "사용자 업로드 선박",
-        type: "Custom Vessel Stream",
-        description: "사용자가 수동으로 입력하거나 업로드한 AIS 정형 시계열 데이터셋입니다.",
-        points: parsed
-      };
-    }
-    const found = VESSEL_PRESETS.find(v => v.mmsi === selectedPresetMmsi);
-    return found || VESSEL_PRESETS[0];
-  }, [selectedPresetMmsi, useCustomData, customCsvText]);
-
-  // Sync custom CSV textarea with preset when switched
   useEffect(() => {
-    if (!useCustomData) {
-      const preset = VESSEL_PRESETS.find(v => v.mmsi === selectedPresetMmsi);
-      if (preset) {
-        setCustomCsvText(jsonToCsv(preset.points));
-      }
+    const updateTime = () => {
+      const now = new Date();
+      setCurrentTimeStr(now.toLocaleString('ko-KR', { timeZone: 'Asia/Seoul' }) + ' KST');
+    };
+    updateTime();
+    const interval = setInterval(updateTime, 1000);
+    return () => clearInterval(interval);
+  }, []);
+
+  // 로그 함수
+  const logToConsole = (msg: string) => {
+    const time = new Date().toLocaleTimeString('ko-KR', { hour12: false });
+    setConsoleLogs(prev => [`[${time}] ${msg}`, ...prev.slice(0, 19)]);
+  };
+
+  // 초기 실행 시 가본 데모 A 로드
+  useEffect(() => {
+    loadDemoA();
+  }, []);
+
+  // 타이머 기반 시뮬레이션 진행
+  useEffect(() => {
+    let timer: any = null;
+    if (isPlaying && simulationPoints.length > 0) {
+      timer = setInterval(() => {
+        setCurrentPlayIdx(prev => {
+          if (prev >= simulationPoints.length - 1) {
+            logToConsole("🎯 시뮬레이션 한 척의 항로 재현 루프를 모두 가동 완료했습니다.");
+            return 0; // 루프 재생
+          }
+          return prev + 1;
+        });
+      }, playSpeed);
     }
-  }, [selectedPresetMmsi, useCustomData]);
+    return () => {
+      if (timer) clearInterval(timer);
+    };
+  }, [isPlaying, simulationPoints, playSpeed]);
 
-  // 1. Data Cleaning Stage (TypeScript Engine)
-  const cleaningResult = useMemo(() => {
-    const raw = currentVesselData.points;
-    const removed: AISPoint[] = [];
-    const cleaned: AISPoint[] = [];
+  // 가용 샘플 적재
+  const loadDemoA = () => {
+    logToConsole("⚡ [샘플 로드] 모드 A (항로 예측 가능 시뮬레이션용 데이터) 적용 중...");
+    
+    // 데이터 구조 가공
+    const flatRows: Record<string, string>[] = [];
+    SAMPLE_A_TRACK.forEach(v => {
+      v.points.forEach(p => {
+        flatRows.push({
+          "선박번호": v.mmsi,
+          "수신시각": p.timestamp,
+          "위도": String(p.lat),
+          "경도": String(p.lon),
+          "속도": String(p.sog),
+          "선수방위": String(p.cog),
+          "선박명": v.name,
+          "선박길이_상": "45",
+          "선박길이_하": "45"
+        });
+      });
+    });
 
-    raw.forEach((p) => {
-      // 1. Invalid coordinates checks
-      const isLatValid = p.lat >= 30 && p.lat <= 40;
-      const isLonValid = p.lon >= 120 && p.lon <= 135;
-      // 2. Realistic Speed Over Ground checklist
-      const isSpeedNormal = p.sog >= 0 && p.sog <= maxSpeedKts;
+    const headersList = ["선박번호", "수신시각", "위도", "경도", "속도", "선수방위", "선박명", "선박길이_상", "선박길이_하"];
+    const rowsList = flatRows.map(obj => headersList.map(h => obj[h] || ''));
 
-      if (isLatValid && isLonValid && isSpeedNormal) {
-        cleaned.push({ ...p, isValid: true });
+    setFileName("sample_coast_trajectory_predictive.csv");
+    setHeaders(headersList);
+    setParsedRows(rowsList);
+    
+    const mapping = autoDetectColumns(headersList);
+    setColumnMapping(mapping);
+
+    const diagnostics = performDiagnostic(headersList, rowsList, mapping, maxSpeedKts);
+    setDiagnostic(diagnostics);
+
+    // MMSI 목록 생성 및 첫 선박 콕 짚기
+    const mmsis = Array.from(new Set(flatRows.map(r => r["선박번호"])));
+    setSelectedMmsi(mmsis[0]);
+    setCurrentPlayIdx(0);
+    setIsPlaying(false);
+
+    logToConsole(`✅ [지도 가동] 총 ${mmsis.length}척의 연속 궤적 인식 성공. 경로 분석 엔진 구동.`);
+  };
+
+  const loadDemoB = () => {
+    logToConsole("⚠️ [샘플 로드] 모드 B (위측 좌표 누락 및 한국어 제원 다수 기형 이상 플래그 데이터) 적용 중...");
+    
+    const headersList = ["선박번호", "선박명", "선박식별번호(IMO)", "호출부호", "선박길이_상", "선박길이_하", "선박길이_좌", "선박길이_우", "수신시각", "속도", "선수방위", "헤딩"];
+    const rowsList = SAMPLE_B_STRUCT_ONLY.map(obj => headersList.map(h => obj[h] || ''));
+
+    setFileName("korea_vessel_profiles_no_coords.csv");
+    setHeaders(headersList);
+    setParsedRows(rowsList);
+
+    const mapping = autoDetectColumns(headersList);
+    setColumnMapping(mapping);
+
+    const diagnostics = performDiagnostic(headersList, rowsList, mapping, maxSpeedKts);
+    setDiagnostic(diagnostics);
+
+    // 모드 B는 시뮬레이션용 데이터 없음
+    setSimulationPoints([]);
+    setPredictions([]);
+    setSelectedMmsi('');
+    logToConsole("🚫 [분석 알림] 위치(경위도) 정보 부재 확정. 모드 B 대시보드로 즉시 자동 시뮬레이션 전환 완료.");
+  };
+
+  // CSV 파싱 실행
+  const processCsvFile = (text: string, name: string) => {
+    try {
+      const rows = parseCsv(text);
+      if (rows.length < 2) {
+        throw new Error("처리할 수 있는 데이터 열이 부족합니다. 최소 헤더 1행 및 데이터 1행이 필요합니다.");
+      }
+      
+      const fileHeaders = rows[0];
+      const dataRows = rows.slice(1);
+
+      setFileName(name);
+      setHeaders(fileHeaders);
+      setParsedRows(dataRows);
+
+      const mapping = autoDetectColumns(fileHeaders);
+      setColumnMapping(mapping);
+
+      const diagnostics = performDiagnostic(fileHeaders, dataRows, mapping, maxSpeedKts);
+      setDiagnostic(diagnostics);
+
+      // 모드 선택
+      if (diagnostics.isPredictable) {
+        const mmsiIdx = fileHeaders.indexOf(mapping.mmsi || '');
+        const uniqueMmsis = Array.from(new Set(dataRows.map(r => r[mmsiIdx]).filter(Boolean)));
+        if (uniqueMmsis.length > 0) {
+          setSelectedMmsi(uniqueMmsis[0]);
+        }
+        logToConsole(`📂 [성공] 항로 예측 조건 충족! ${uniqueMmsis.length}척 선적 로드.`);
       } else {
-        removed.push({ ...p, isValid: false });
+        setSelectedMmsi('');
+        setSimulationPoints([]);
+        setPredictions([]);
+        logToConsole("📂 [주의] 위치 컬럼 미식별 혹은 결손 발견. 모드 B 정적 상태 정밀 진단 검사를 진행합니다.");
+      }
+
+    } catch (e: any) {
+      logToConsole(`❌ [파싱 실패]: ${e.message}`);
+      alert(`CSV 파일 해석 중 오류 발생: ${e.message}`);
+    }
+  };
+
+  // 인코딩 적용 로드
+  const handleFileUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+
+    readAndDecode(file);
+  };
+
+  const readAndDecode = (file: File) => {
+    const reader = new FileReader();
+    
+    // 자동 감지 시, EUC-KR에 한글 파괴 여부 검사 로직 적용
+    if (encoding === 'AUTO') {
+      reader.onload = (evt) => {
+        const arr = new Uint8Array(evt.target?.result as ArrayBuffer);
+        // 간단한 한글 깨짐 분석을 통해 인코딩 매핑 분기
+        let guessedEncoding = 'utf-8';
+        for (let i = 0; i < arr.length - 1; i++) {
+          if (arr[i] === 0xBC && arr[i+1] === 0xAD) { // "선" 이라는 글자 CP949 바이트 매핑 확인용 등
+            guessedEncoding = 'cp949';
+            break;
+          }
+          // 한글 뷰어로 공통 검사 코드 바이트가 있는지
+          if (arr[i] >= 0x81 && arr[i] <= 0xFE && arr[i+1] >= 0x41 && arr[i+1] <= 0xFE) {
+            if (!(arr[i] >= 0xC0 && arr[i] <= 0xDF && arr[i+1] >= 0x80 && arr[i+1] <= 0xBF)) {
+              guessedEncoding = 'cp949';
+            }
+          }
+        }
+        
+        const textDecoder = new TextDecoder(guessedEncoding);
+        const decodedText = textDecoder.decode(arr);
+        logToConsole(`📂 [파일 로드] ${file.name} - 인코딩 자동 감지: ${guessedEncoding.toUpperCase()}`);
+        processCsvFile(decodedText, file.name);
+      };
+      reader.readAsArrayBuffer(file);
+    } else {
+      reader.onload = (evt) => {
+        const text = evt.target?.result as string;
+        logToConsole(`📂 [파일 로드] ${file.name} - 사용자 지정 인코딩: ${encoding}`);
+        processCsvFile(text, file.name);
+      };
+      reader.readAsText(file, encoding);
+    }
+  };
+
+  // 드롭 앤 드롭 지원
+  const handleDragOver = (e: React.DragEvent) => {
+    e.preventDefault();
+    setIsDragging(true);
+  };
+
+  const handleDragLeave = () => {
+    setIsDragging(false);
+  };
+
+  const handleDrop = (e: React.DragEvent) => {
+    e.preventDefault();
+    setIsDragging(false);
+    const file = e.dataTransfer.files?.[0];
+    if (file) {
+      readAndDecode(file);
+    }
+  };
+
+  // 슬라이더 변경 시 동적 실시간 진단 재검침
+  useEffect(() => {
+    if (headers.length > 0 && parsedRows.length > 0) {
+      const diagnostics = performDiagnostic(headers, parsedRows, columnMapping, maxSpeedKts);
+      setDiagnostic(diagnostics);
+    }
+  }, [maxSpeedKts]);
+
+  // 선택 MMSI 변경 혹은 컬럼 변경 시 모드 A 예측 시뮬레이션 계산
+  useEffect(() => {
+    if (!diagnostic || !diagnostic.isPredictable || !selectedMmsi) return;
+
+    const mmsiIdx = headers.indexOf(columnMapping.mmsi || '');
+    const timeIdx = headers.indexOf(columnMapping.timestamp || '');
+    const latIdx = headers.indexOf(columnMapping.lat || '');
+    const lonIdx = headers.indexOf(columnMapping.lon || '');
+    const sogIdx = headers.indexOf(columnMapping.sog || '');
+    const cogIdx = headers.indexOf(columnMapping.cog || '');
+
+    // 1. 해당 선박 데이터 필터링
+    const vRows = parsedRows.filter(row => row[mmsiIdx] === selectedMmsi);
+    
+    // 2. 시간순 정렬
+    const points: AISPoint[] = vRows.map((row, rIdx) => {
+      const latVal = parseFloat(row[latIdx]) || 0;
+      const lonVal = parseFloat(row[lonIdx]) || 0;
+      const sogVal = parseFloat(row[sogIdx]) || 0;
+      const cogVal = parseFloat(row[cogIdx]) || 0;
+      
+      const originalRow: Record<string, string> = {};
+      headers.forEach((h, idx) => { originalRow[h] = row[idx]; });
+
+      return {
+        mmsi: selectedMmsi,
+        timestamp: row[timeIdx] || 'N/A',
+        lat: latVal,
+        lon: lonVal,
+        sog: sogVal,
+        cog: cogVal,
+        originalRow
+      };
+    });
+
+    const sortedPoints = points.sort((a, b) => {
+      return new Date(a.timestamp).getTime() - new Date(b.timestamp).getTime();
+    });
+
+    setSimulationPoints(sortedPoints);
+
+    // 3. 관제 시뮬레이션 연산 (2차 물리 관성 예측 보간 모델링)
+    const computedPreds: PredictionResult[] = [];
+    sortedPoints.forEach((p, idx) => {
+      if (idx === 0) {
+        computedPreds.push({
+          timestamp: p.timestamp,
+          actual_lat: p.lat,
+          actual_lon: p.lon,
+          pred_lat: p.lat,
+          pred_lon: p.lon,
+          error_distance_m: 0
+        });
+      } else if (idx === 1) {
+        // 단일 직전 값 등속 가정
+        const prev = sortedPoints[idx - 1];
+        computedPreds.push({
+          timestamp: p.timestamp,
+          actual_lat: p.lat,
+          actual_lon: p.lon,
+          pred_lat: prev.lat,
+          pred_lon: prev.lon,
+          error_distance_m: Math.round(getDistanceMeter(p.lat, p.lon, prev.lat, prev.lon))
+        });
+      } else {
+        // t-1, t-2 기반 2차 가속 자율예측
+        const prev1 = sortedPoints[idx - 1];
+        const prev2 = sortedPoints[idx - 2];
+        const predLat = prev1.lat + (prev1.lat - prev2.lat);
+        const predLon = prev1.lon + (prev1.lon - prev2.lon);
+        const err = Math.round(getDistanceMeter(p.lat, p.lon, predLat, predLon));
+
+        computedPreds.push({
+          timestamp: p.timestamp,
+          actual_lat: p.lat,
+          actual_lon: p.lon,
+          pred_lat: predLat,
+          pred_lon: predLon,
+          error_distance_m: err
+        });
       }
     });
 
-    // Time-series sorting
-    cleaned.sort((a, b) => new Date(a.timestamp).getTime() - new Date(b.timestamp).getTime());
+    setPredictions(computedPreds);
+    setCurrentPlayIdx(0);
 
-    return { cleaned, removed };
-  }, [currentVesselData, maxSpeedKts]);
+  }, [selectedMmsi, parsedRows, headers, columnMapping, maxSpeedKts]);
 
-  // helper distance formula
-  const getKmDistance = (lat1: number, lon1: number, lat2: number, lon2: number) => {
-    const R = 6371; // km
+  // 경위도 기반 거리 연산 미터 환산 함수 (하버사인 식)
+  function getDistanceMeter(lat1: number, lon1: number, lat2: number, lon2: number) {
+    const R = 6371000; // 지구 반경
     const dLat = (lat2 - lat1) * Math.PI / 180;
     const dLon = (lon2 - lon1) * Math.PI / 180;
     const a = 
@@ -125,1339 +392,1051 @@ export default function App() {
       Math.sin(dLon/2) * Math.sin(dLon/2);
     const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1-a));
     return R * c;
+  }
+
+  // 맵 드래그(팬) 지원
+  const handleMapMouseDown = (e: React.MouseEvent) => {
+    setDragStart({ x: e.clientX - viewport.x, y: e.clientY - viewport.y });
   };
 
-  // 2. Feature Engineering Logic (TypeScript Engine)
-  const engineeredData = useMemo(() => {
-    const { cleaned } = cleaningResult;
-    const features: PreparedFeature[] = [];
-
-    for (let i = 0; i < cleaned.length; i++) {
-      const current = cleaned[i];
-      const lag1 = i >= 1 ? cleaned[i - 1] : null;
-      const lag2 = i >= 2 ? cleaned[i - 2] : null;
-
-      const sog_diff = lag1 ? Number((current.sog - lag1.sog).toFixed(2)) : 0;
-      const cog_raw_diff = lag1 ? current.cog - lag1.cog : 0;
-      // COG wrapping to -180 to 180
-      const cog_diff = lag1 ? Number((((cog_raw_diff + 180) % 360 + 360) % 360 - 180).toFixed(1)) : 0;
-      
-      const dist = lag1 ? Number(getKmDistance(current.lat, current.lon, lag1.lat, lag1.lon).toFixed(3)) : 0;
-
-      features.push({
-        mmsi: current.mmsi,
-        timestamp: current.timestamp,
-        lat: current.lat,
-        lon: current.lon,
-        sog: current.sog,
-        cog: current.cog,
-        lat_lag1: lag1 ? lag1.lat : null,
-        lon_lag1: lag1 ? lag1.lon : null,
-        lat_lag2: lag2 ? lag2.lat : null,
-        lon_lag2: lag2 ? lag2.lon : null,
-        sog_lag1: lag1 ? lag1.sog : null,
-        sog_diff,
-        cog_diff,
-        distance_from_lag: dist
-      });
-    }
-
-    return features;
-  }, [cleaningResult]);
-
-  // 3. Predictive Lookahead Engine (Simulates physics-based inertially-corrected neural prediction or LightGBM model)
-  const predictionResults = useMemo(() => {
-    const features = engineeredData;
-    const predictions: PredictionResult[] = [];
-
-    for (let i = 0; i < features.length - 1; i++) {
-      const current = features[i];
-      const nextActual = features[i + 1];
-
-      // Physical kinematic dead reckoning vector
-      // SOG conversion from knots to degrees per 5min
-      // 1 knot = 0.514 m/s. 5min = 300sec. Dist = 154 meters per knot.
-      // Lat degree = ~111.3 km. Lon degree = ~111.3 * cos(lat) km.
-      const scaleKtsToLat = (154.2 / 111320); 
-      const scaleKtsToLon = (154.2 / (111320 * Math.cos(current.lat * Math.PI / 180)));
-
-      const rad = (current.cog * Math.PI) / 180;
-      
-      // Theoretical kinematic point
-      const kinematicLat = current.lat + (current.sog * Math.cos(rad) * scaleKtsToLat);
-      const kinematicLon = current.lon + (current.sog * Math.sin(rad) * scaleKtsToLon);
-
-      // LightGBM / XGBoost correction simulation - learns vessel custom steering habits and lag adjustments
-      // If there are previous lag values, it weights the direction inertia
-      let regressedLat = kinematicLat;
-      let regressedLon = kinematicLon;
-
-      if (current.lat_lag1 && current.lon_lag1) {
-        // Model extracts inertial momentum (t - (t-1)) weight
-        const inertiaWeight = 0.12; 
-        const momentumLat = current.lat - current.lat_lag1;
-        const momentumLon = current.lon - current.lon_lag1;
-        
-        // Simulates modeling tree ensemble adjustments (including estimators count correction factor)
-        const estimatorFactor = Math.min(1.2, xgboostEstimators / 100);
-        regressedLat += (momentumLat * inertiaWeight * estimatorFactor);
-        regressedLon += (momentumLon * inertiaWeight * estimatorFactor);
-      }
-
-      // Add a touch of natural water drift / wind error to avoid perfect cheat predictions
-      const seaDriftLat = Math.sin(current.lon * 50) * 0.00015;
-      const seaDriftLon = Math.cos(current.lat * 50) * 0.00018;
-
-      const pred_lat = Number((regressedLat + seaDriftLat).toFixed(5));
-      const pred_lon = Number((regressedLon + seaDriftLon).toFixed(5));
-
-      // Coordinate offset error in meters
-      const err_km = getKmDistance(nextActual.lat, nextActual.lon, pred_lat, pred_lon);
-      const error_distance_m = Math.round(err_km * 1000);
-
-      predictions.push({
-        timestamp: nextActual.timestamp,
-        actual_lat: nextActual.lat,
-        actual_lon: nextActual.lon,
-        pred_lat,
-        pred_lon,
-        error_distance_m
-      });
-    }
-
-    return predictions;
-  }, [engineeredData, xgboostEstimators]);
-
-  // Busan Base Security Zone boundary definition to check geofence alarm range
-  // Simple Box: Lat: 34.80 ~ 34.85, Lon: 129.48 ~ 129.53
-  const isInsideRestrictedZone = (lat: number, lon: number) => {
-    return lat >= 34.80 && lat <= 34.84 && lon >= 129.48 && lon <= 129.53;
-  };
-
-  // 4. Anomaly Monitoring Suite
-  const anomaliesList = useMemo(() => {
-    const list: AnomalyRecord[] = [];
-    
-    // Add noise points removed from preprocessing phase
-    cleaningResult.removed.forEach((p, idx) => {
-      list.push({
-        timestamp: p.timestamp,
-        mmsi: p.mmsi,
-        lat: p.lat,
-        lon: p.lon,
-        type: 'NOISE_FILTERED',
-        severity: 'low',
-        message: `[MMSI: ${p.mmsi}] 비현실적인 기형 데이터 (${p.sog} kts) 전처리 필터로 감지 및 소거`
-      });
+  const handleMapMouseMove = (e: React.MouseEvent) => {
+    if (!dragStart) return;
+    setViewport({
+      ...viewport,
+      x: e.clientX - dragStart.x,
+      y: e.clientY - dragStart.y
     });
-
-    // Check engineered sequence
-    engineeredData.forEach((feat, index) => {
-      // Alarm 1: SOG Sudden Accel/Decel Check
-      if (feat.sog_diff !== null && Math.abs(feat.sog_diff) > 6.0) {
-        list.push({
-          timestamp: feat.timestamp,
-          mmsi: feat.mmsi,
-          lat: feat.lat,
-          lon: feat.lon,
-          type: 'SOG_SUDDEN',
-          severity: Math.abs(feat.sog_diff) > 10 ? 'high' : 'medium',
-          message: `[MMSI: ${feat.mmsi}] SOG 급변경 감지: 5분 새 ${feat.sog_diff} kts 변화`
-        });
-      }
-
-      // Alarm 2: COG Sudden shift check
-      if (feat.cog_diff !== null && Math.abs(feat.cog_diff) > anomalyCofThreshold) {
-        list.push({
-          timestamp: feat.timestamp,
-          mmsi: feat.mmsi,
-          lat: feat.lat,
-          lon: feat.lon,
-          type: 'COG_SUDDEN',
-          severity: Math.abs(feat.cog_diff) > 75 ? 'high' : 'medium',
-          message: `[MMSI: ${feat.mmsi}] 조타 방향 급회전 감지: COG ${feat.cog_diff}° 급변`
-        });
-      }
-
-      // Alarm 3: Restricted Geofence Trespass checklist
-      if (isInsideRestrictedZone(feat.lat, feat.lon)) {
-        list.push({
-          timestamp: feat.timestamp,
-          mmsi: feat.mmsi,
-          lat: feat.lat,
-          lon: feat.lon,
-          type: 'GEOFENCE_VIOLATION',
-          severity: 'high',
-          message: `[MMSI: ${feat.mmsi}] 대한민국 해군 해역 통제구역 진입 감지 (위경도: ${feat.lat}, ${feat.lon})`
-        });
-      }
-    });
-
-    // Alarm 4: Machine Learning predictive path error deviation check
-    predictionResults.forEach((pred) => {
-      if (pred.error_distance_m > 480) {
-        list.push({
-          timestamp: pred.timestamp,
-          mmsi: currentVesselData.mmsi,
-          lat: pred.actual_lat,
-          lon: pred.actual_lon,
-          type: '위험 구역 항로 이탈',
-          severity: pred.error_distance_m > 900 ? 'high' : 'medium',
-          message: `[MMSI: ${currentVesselData.mmsi}] 인공지능이 계산한 정상 범위를 벗어난 의심 기동 포착 (이격 거리: ${pred.error_distance_m}m)`
-        });
-      }
-    });
-
-    return list.sort((a,b) => new Date(a.timestamp).getTime() - new Date(b.timestamp).getTime());
-  }, [cleaningResult, engineeredData, predictionResults, anomalyCofThreshold, currentVesselData.mmsi]);
-
-  // Overall Statistics Metrics
-  const summaryMetrics = useMemo(() => {
-    const rawCount = currentVesselData.points.length;
-    const cleanCount = cleaningResult.cleaned.length;
-    const noiseCount = cleaningResult.removed.length;
-    
-    // Average Prediction Error
-    const errors = predictionResults.map(p => p.error_distance_m);
-    const avgPredictionError = errors.length > 0 ? Math.round(errors.reduce((sum, e) => sum + e, 0) / errors.length) : 0;
-    
-    // Safety score out of 100 based on anomalies severity
-    let penalty = 0;
-    anomaliesList.forEach(a => {
-      if (a.severity === 'high') penalty += 18;
-      else if (a.severity === 'medium') penalty += 8;
-      else penalty += 2;
-    });
-    const safetyScore = Math.max(10, 100 - penalty);
-
-    return {
-      rawCount,
-      cleanCount,
-      noiseCount,
-      avgPredictionError,
-      safetyScore
-    };
-  }, [currentVesselData, cleaningResult, predictionResults, anomaliesList]);
-
-  // Sync animation bounds
-  useEffect(() => {
-    if (currentPlayIdx >= cleaningResult.cleaned.length) {
-      setCurrentPlayIdx(0);
-    }
-  }, [cleaningResult.cleaned]);
-
-  // Playback Interval Control
-  useEffect(() => {
-    let timer: NodeJS.Timeout | null = null;
-    if (isAnimating) {
-      timer = setInterval(() => {
-        setCurrentPlayIdx(prev => {
-          if (prev >= cleaningResult.cleaned.length - 1) {
-            setIsAnimating(false);
-            setSystemLogs(l => [...l.slice(-15), `[알림] AIS 시나리오 모니터링 주행 재생 완료`]);
-            return 0;
-          }
-          const nextIdx = prev + 1;
-          
-          // Generate a log on specific events during playback
-          const point = cleaningResult.cleaned[nextIdx];
-          const pointAnomalies = anomaliesList.filter(a => a.timestamp === point.timestamp);
-          
-          if (pointAnomalies.length > 0) {
-            const worstAlert = pointAnomalies[0];
-            const severityKo = worstAlert.severity === 'high' ? '🚨심각' : '⚠️경고';
-            setSystemLogs(l => [...l.slice(-15), `[${severityKo}] ${worstAlert.message}`]);
-          } else {
-            setSystemLogs(l => [...l.slice(-15), `[관제] MMSI ${point.mmsi} 순차 모니터링 - Lat: ${point.lat.toFixed(3)}, Lon: ${point.lon.toFixed(3)} | SOG: ${point.sog} kts`]);
-          }
-
-          return nextIdx;
-        });
-      }, 3000 / playbackSpeed);
-    }
-    return () => {
-      if (timer) clearInterval(timer);
-    };
-  }, [isAnimating, cleaningResult.cleaned, anomaliesList, playbackSpeed]);
-
-  // Dynamic coordinates bounding box calculations for SVG Auto-fitting
-  const mapBounds = useMemo(() => {
-    const pts = currentVesselData.points;
-    if (pts.length === 0) {
-      return { minLat: 34.0, maxLat: 36.0, minLon: 128.0, maxLon: 130.0 };
-    }
-    const lats = pts.map(p => p.lat);
-    const lons = pts.map(p => p.lon);
-    
-    // Add manual buffering to keep standard bounds consistent
-    const minLat = Math.min(...lats) - 0.08;
-    const maxLat = Math.max(...lats) + 0.08;
-    const minLon = Math.min(...lons) - 0.08;
-    const maxLon = Math.max(...lons) + 0.08;
-
-    return { minLat, maxLat, minLon, maxLon };
-  }, [currentVesselData]);
-
-  // Convert Latitude / Longitude into beautiful SVG Cartographic coordinate space points (X: 0~100, Y: 0~100)
-  const getSvgCoordinates = (lat: number, lon: number) => {
-    const latRange = mapBounds.maxLat - mapBounds.minLat;
-    const lonRange = mapBounds.maxLon - mapBounds.minLon;
-
-    // Percentages mapping with inverted Latitude (since SVG Y proceeds downward)
-    const x = ((lon - mapBounds.minLon) / lonRange) * 100;
-    const y = (1 - (lat - mapBounds.minLat) / latRange) * 100;
-
-    return {
-      x: x * zoomLevel + panOffset.x,
-      y: y * zoomLevel + panOffset.y
-    };
   };
 
-  // Pre-calculate SVG positions for original raw, cleaned, and predictions lists
-  const svgLines = useMemo(() => {
-    const rawSvg = currentVesselData.points.map(p => ({ ...p, ...getSvgCoordinates(p.lat, p.lon) }));
-    const preproSvg = cleaningResult.cleaned.map((p, idx) => ({ ...p, ...getSvgCoordinates(p.lat, p.lon), index: idx }));
-    const predSvg = predictionResults.map(p => ({
-      ...p,
-      actual: getSvgCoordinates(p.actual_lat, p.actual_lon),
-      pred: getSvgCoordinates(p.pred_lat, p.pred_lon)
-    }));
-
-    return { rawSvg, preproSvg, predSvg };
-  }, [currentVesselData.points, cleaningResult.cleaned, predictionResults, zoomLevel, panOffset, mapBounds]);
-
-  // Busan region mock ports coordinates to lay beautifully as landmarks
-  const landMarks = [
-    { name: "BUSAN HARBOR (부산북항)", lat: 35.105, lon: 129.045 },
-    { name: "YONGDO ISL. (영도)", lat: 35.071, lon: 129.068 },
-    { name: "ORYUKDO KEYS (오륙도)", lat: 35.093, lon: 129.123 },
-    { name: "GADEOK ISL. (가덕도)", lat: 35.020, lon: 128.835 },
-    { name: "WEST CHANNEL (서해안 수로)", lat: 34.900, lon: 128.950 },
-    { name: "TSUSHIMA PASS (대마도 수로)", lat: 34.580, lon: 129.650 },
-  ];
-
-  // Restricted polygon coordinates in SVG coords
-  const restrictedAreaPointsStr = useMemo(() => {
-    // Area corners
-    const c1 = getSvgCoordinates(34.84, 129.48);
-    const c2 = getSvgCoordinates(34.84, 129.53);
-    const c3 = getSvgCoordinates(34.80, 129.53);
-    const c4 = getSvgCoordinates(34.80, 129.48);
-    return `${c1.x},${c1.y} ${c2.x},${c2.y} ${c3.x},${c3.y} ${c4.x},${c4.y}`;
-  }, [zoomLevel, panOffset, mapBounds]);
-
-  // Handle active file uploading parser
-  const handleFileUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
-    const file = e.target.files?.[0];
-    if (!file) return;
-
-    const reader = new FileReader();
-    reader.onload = (event) => {
-      const text = event.target?.result as string;
-      if (text) {
-        setCustomCsvText(text);
-        setUseCustomData(true);
-        setSystemLogs(l => [...l, `[업로드] 외부 CSV 파일 성공적으로 주입됨 (${file.name})`]);
-      }
-    };
-    reader.readAsText(file);
+  const handleMapMouseUp = () => {
+    setDragStart(null);
   };
 
-  const copyToClipboard = (text: string, label: string) => {
-    navigator.clipboard.writeText(text);
-    setCopiedCodeIndex(label);
-    setTimeout(() => setCopiedCodeIndex(null), 2000);
+  const handleZoom = (factor: number) => {
+    setViewport(v => ({ ...v, scale: Math.max(0.5, Math.min(8, v.scale * factor)) }));
   };
 
-  const resetMapMatrix = () => {
-    setZoomLevel(1.2);
-    setPanOffset({ x: 0, y: 0 });
-    setSystemLogs(l => [...l, `[관제] 관제 화면 스케일 중앙화 완료`]);
+  const handleResetMap = () => {
+    setViewport({ scale: 1, x: 0, y: 0 });
+    logToConsole("🗺️ 지도 줌 레벨 및 중심 뷰포트를 초기화했습니다.");
   };
 
-  // Convert map canvas mouse position to actual geographic Latitude / Longitude
-  const handleMapMouseMove = (e: React.MouseEvent<SVGSVGElement, MouseEvent>) => {
-    const rect = e.currentTarget.getBoundingClientRect();
-    const percentX = (e.clientX - rect.left) / rect.width;
-    const percentY = (e.clientY - rect.top) / rect.height;
-
-    // Inverse Zooming/Panning
-    const originalPercentX = (percentX * 100 - panOffset.x) / zoomLevel;
-    const originalPercentY = (percentY * 100 - panOffset.y) / zoomLevel;
-
-    const latRange = mapBounds.maxLat - mapBounds.minLat;
-    const lonRange = mapBounds.maxLon - mapBounds.minLon;
-
-    const lon = mapBounds.minLon + (originalPercentX / 100) * lonRange;
-    const lat = mapBounds.maxLat - (originalPercentY / 100) * latRange;
-
-    if (lat >= 30 && lat <= 40 && lon >= 120 && lon <= 135) {
-      setMapCursorLatLng({ lat, lon });
-    } else {
-      setMapCursorLatLng(null);
-    }
+  // 파이썬 내보내기 복사 기능
+  const copyPythonCode = (codeText: string) => {
+    navigator.clipboard.writeText(codeText);
+    setCopiedCode(true);
+    logToConsole("📋 [클립보드] 파이썬 고등 분석 7단계 템플릿 코드를 클립보드에 기록 복사했습니다.");
+    setTimeout(() => setCopiedCode(false), 2000);
   };
+
+  // 보호구역 침범 및 급격한 오염 이탈 진단
+  const activePred = predictions[currentPlayIdx];
+  const activePoint = simulationPoints[currentPlayIdx];
+  const isDeviationAlert = activePred?.error_distance_m > 480;
+
+  // 산호초 보호 구역 진입 통계
+  const reefCenter = { lat: 34.68, lon: 129.04 };
+  const getIsNearReef = (lat: number, lon: number) => {
+    return getDistanceMeter(lat, lon, reefCenter.lat, reefCenter.lon) < 6000; // 6km 이내 경보용 버퍼
+  };
+
+  const currentDistanceToReef = activePoint ? Math.round(getDistanceMeter(activePoint.lat, activePoint.lon, reefCenter.lat, reefCenter.lon)) : 0;
+  const isInsideReefForbidden = currentDistanceToReef < 3000; // 3km 이내 무단 침범 한계선
 
   return (
-    <div className="min-h-screen bg-bg-theme text-slate-100 font-sans flex flex-col antialiased selection:bg-accent-theme/30 selection:text-accent-theme">
+    <div className="min-h-screen bg-[#070b13] text-slate-100 flex flex-col font-sans antialiased selection:bg-teal-500/30 selection:text-teal-200">
       
-      {/* HEADER SECTION WITH MARINE RADAR COMMAND HUD TITLE */}
-      <header className="border-b border-border-theme bg-panel-theme px-6 py-4 flex flex-col md:flex-row items-center justify-between gap-4 select-none shadow-sm">
+      {/* HEADER BAR */}
+      <header className="bg-[#090f19] border-b border-slate-800 px-6 py-4 flex flex-col md:flex-row justify-between items-start md:items-center shrink-0">
         <div className="flex items-center gap-3">
-          <div className="relative flex items-center justify-center w-10 h-10 rounded bg-accent-theme/5 border border-accent-theme/35 text-accent-theme">
-            <span className="absolute inline-flex h-2 w-2 rounded bg-accent-theme animate-ping" />
-            <Compass className="w-5 h-5 animate-spin-slow" />
+          <div className="w-10 h-10 rounded-lg bg-teal-500/10 flex items-center justify-center border border-teal-500/30 shadow-inner">
+            <Shield className="w-5 h-5 text-teal-400 animate-pulse" />
           </div>
           <div>
             <div className="flex items-center gap-2">
-              <span className="text-[10px] font-mono px-1.5 py-0.5 rounded-sm bg-accent-theme/10 text-accent-theme border border-accent-theme/30 font-bold uppercase tracking-wider">SYSTEM OPERATIONAL</span>
-              <span className="text-xs font-mono text-slate-500">v3.42 - 산호초 보호 인공지능</span>
+              <span className="text-[9px] font-mono font-bold bg-teal-500/20 text-teal-300 border border-teal-500/40 px-1.5 py-0.5 rounded leading-none">AIS WATCHDOG</span>
+              <span className="text-[10px] font-mono text-slate-500">{currentTimeStr}</span>
             </div>
-            <h1 className="text-lg font-bold font-display tracking-tight text-white flex items-center gap-2 mt-0.5">
-              인공지능 기반 산호초 보호 및 해양 오염원 실시간 감시 시스템
+            <h1 className="text-base font-bold text-white tracking-tight font-display">
+              AIS CSV 진단 및 선박 이상값 감시 시뮬레이터
             </h1>
           </div>
         </div>
 
-        {/* TOP DASHBOARD COUNTER BADGES */}
-        <div className="flex flex-wrap items-center gap-2.5 md:gap-4 md:ml-auto">
-          <div className="px-3 py-1.5 rounded border border-border-theme bg-panel-theme flex items-center gap-2 min-w-[130px]">
-            <Database className="w-4 h-4 text-accent-theme" />
-            <div>
-              <div className="text-[9px] text-slate-500 font-mono font-bold leading-none uppercase tracking-wider">AIS RAW RECORDS</div>
-              <div className="text-xs font-bold text-white font-mono mt-0.5">{summaryMetrics.rawCount} <span className="text-[10px] font-normal text-slate-500">Pts</span></div>
-            </div>
-          </div>
-
-          <div className="px-3 py-1.5 rounded border border-border-theme bg-panel-theme flex items-center gap-2 min-w-[130px]">
-            <Sliders className="w-4 h-4 text-emerald-400" />
-            <div>
-              <div className="text-[9px] text-slate-500 font-mono font-bold leading-none uppercase tracking-wider">PREPROCESSED</div>
-              <div className="text-xs font-bold text-white font-mono mt-0.5">
-                {summaryMetrics.cleanCount} <span className="text-[10px] text-emerald-400 font-normal">({Math.round((summaryMetrics.cleanCount/summaryMetrics.rawCount)*100) || 100}%)</span>
-              </div>
-            </div>
-          </div>
-
-          <div className="px-3 py-1.5 rounded border border-red-950/45 bg-red-950/10 flex items-center gap-2 min-w-[130px]">
-            <AlertTriangle className="w-4 h-4 text-rose-400 animate-pulse" />
-            <div>
-              <div className="text-[9px] text-rose-500/80 font-mono font-bold leading-none uppercase tracking-wider">ANOMALY DETECTED</div>
-              <div className="text-xs font-bold text-rose-400 font-mono mt-0.5">{anomaliesList.length} <span className="text-[10px] font-normal text-rose-600/80">Alerts</span></div>
-            </div>
-          </div>
-
-          <div className="px-3 py-1.5 rounded border border-border-theme bg-panel-theme flex items-center gap-2 min-w-[130px]">
-            <Cpu className="w-4 h-4 text-amber-400" />
-            <div>
-              <div className="text-[9px] text-slate-500 font-mono font-bold leading-none uppercase tracking-wider">인공지능 경로 분석</div>
-              <div className="text-xs font-bold text-white mt-0.5">
-                정상 오차 범위: 300m 이내
-              </div>
-            </div>
-          </div>
+        {/* TOP CONTROLS & CHANGER */}
+        <div className="flex flex-wrap items-center gap-3 mt-3 md:mt-0">
+          <button 
+            onClick={() => setActiveTab('dashboard')} 
+            className={`px-3 py-1.5 rounded text-xs font-semibold tracking-wide flex items-center gap-1.5 transition-all ${activeTab === 'dashboard' ? 'bg-teal-500 text-slate-900 font-bold shadow' : 'bg-slate-800 text-slate-300 hover:bg-slate-700'}`}
+          >
+            <LayoutDashboard className="w-3.5 h-3.5" />
+            관제 및 품질 분석 판넬
+          </button>
+          <button 
+            onClick={() => setActiveTab('code')} 
+            className={`px-3 py-1.5 rounded text-xs font-semibold tracking-wide flex items-center gap-1.5 transition-all ${activeTab === 'code' ? 'bg-teal-500 text-slate-900 font-bold shadow' : 'bg-slate-800 text-slate-300 hover:bg-slate-700'}`}
+          >
+            <Code className="w-3.5 h-3.5" />
+            파이썬(Python) 내보내기 탭
+          </button>
         </div>
       </header>
 
-      {/* CORE CONTENT LAYOUT GRID */}
-      <div className="grow grid grid-cols-1 xl:grid-cols-12 overflow-hidden">
+      {/* CORE WRAPPER */}
+      <main className="grow flex flex-col lg:flex-row overflow-hidden">
         
-        {/* LEFT COLUMN: ACTIVE INTERACTIVE PIPELINE CONTROLLERS */}
-        <section className="xl:col-span-3 border-r border-border-theme bg-bg-theme flex flex-col overflow-y-auto max-h-[calc(100vh-73px)] custom-scrollbar">
+        {/* LEFT COMPONENT: CONTROL RAIL */}
+        <div className="w-full lg:w-[380px] bg-[#090f19]/80 border-r border-slate-800 flex flex-col overflow-y-auto shrink-0 divide-y divide-slate-800/80 custom-scrollbar">
           
-          {/* STEP 1: SELECT / UPLOAD AIS SCENARIO DATASETS */}
-          <div className="p-4 border-b border-border-theme">
-            <div className="flex items-center gap-2 mb-3">
-              <span className="text-[10px] font-mono font-bold bg-accent-theme text-bg-theme w-5 h-5 rounded flex items-center justify-center shadow-md">1</span>
-              <h2 className="text-xs font-bold text-white uppercase tracking-wider font-display">[1] 감시 대상 선박 선택</h2>
+          {/* SEC 1: CSV FILE INFUSION */}
+          <div className="p-5 space-y-4">
+            <div className="flex items-center justify-between">
+              <div className="flex items-center gap-2">
+                <span className="text-[10px] font-mono font-bold bg-teal-500 text-slate-900 w-5 h-5 rounded flex items-center justify-center">1</span>
+                <span className="text-xs font-bold text-slate-200">선박 AIS CSV 주입</span>
+              </div>
+              <span className="text-[10px] text-slate-500 font-mono">ENCODING SUPPORT</span>
             </div>
 
-            {/* PRESETS NAVIGATION ACCORDION */}
-            <div className="space-y-1.5 mb-3.5">
-              {VESSEL_PRESETS.map((vsel) => (
-                <button
-                  key={vsel.mmsi}
-                  id={`preset-btn-${vsel.mmsi}`}
-                  onClick={() => {
-                    setSelectedPresetMmsi(vsel.mmsi);
-                    setUseCustomData(false);
-                    setCurrentPlayIdx(0);
-                    setIsAnimating(false);
-                    setSystemLogs(l => [...l, `[연동] 선박 프리셋 로드 - ${vsel.name} | MMSI: ${vsel.mmsi}`]);
+            {/* DRAG ZONE */}
+            <div 
+              onDragOver={handleDragOver}
+              onDragLeave={handleDragLeave}
+              onDrop={handleDrop}
+              className={`border-2 border-dashed rounded-lg p-5 flex flex-col items-center justify-center text-center cursor-pointer transition-all ${isDragging ? 'border-teal-400 bg-teal-500/5' : 'border-slate-800 hover:border-slate-700 hover:bg-slate-900/40'}`}
+              onClick={() => document.getElementById('vessel-file-upload')?.click()}
+            >
+              <Upload className="w-8 h-8 text-slate-500 mb-2" />
+              <p className="text-xs font-medium text-slate-300">내 로컬 AIS CSV 파일 업로드</p>
+              <p className="text-[10px] text-slate-500 mt-1">드래그 앤 드롭 또는 클릭하여 찾아보기</p>
+              <input 
+                id="vessel-file-upload" 
+                type="file" 
+                accept=".csv" 
+                className="hidden" 
+                onChange={handleFileUpload}
+              />
+            </div>
+
+            {/* ENCODING SETTER & FILE STAT */}
+            <div className="grid grid-cols-2 gap-3">
+              <div>
+                <label className="block text-[10px] text-slate-400 font-bold mb-1">인코딩 처리 형식</label>
+                <select 
+                  value={encoding} 
+                  onChange={(e) => {
+                    setEncoding(e.target.value);
+                    logToConsole(`⚙️ 기본 인코딩 설정을 [${e.target.value}] 로 전환했습니다. 다음 업로드 시 강제 적용됩니다.`);
                   }}
-                  className={`w-full text-left p-2.5 rounded border transition-all flex items-center justify-between ${
-                    !useCustomData && selectedPresetMmsi === vsel.mmsi
-                      ? 'bg-panel-theme border-accent-theme text-white border-l-4 shadow-sm'
-                      : 'bg-panel-theme/40 border-border-theme text-slate-400 hover:text-slate-200 hover:bg-panel-theme'
-                  }`}
+                  className="w-full text-xs font-mono bg-slate-900 text-slate-300 border border-slate-800 rounded px-2 py-1.5 focus:border-teal-500 focus:outline-none"
                 >
-                  <div className="flex items-center gap-2">
-                    <Ship className={`w-4 h-4 ${!useCustomData && selectedPresetMmsi === vsel.mmsi ? 'text-accent-theme' : 'text-slate-500'}`} />
-                    <div className="truncate">
-                      <div className="text-xs font-bold font-display truncate">{vsel.name}</div>
-                      <div className="text-[10px] font-mono text-slate-500">MMSI: {vsel.mmsi}</div>
-                    </div>
-                  </div>
-                  <ChevronRight className="w-3.5 h-3.5 opacity-55" />
-                </button>
-              ))}
+                  <option value="AUTO">자동 판독 (추천)</option>
+                  <option value="cp949">CP949 (한국공공제원)</option>
+                  <option value="utf-8">UTF-8 (공통 규격)</option>
+                  <option value="euc-kr">EUC-KR (한글 표준)</option>
+                </select>
+              </div>
+
+              <div>
+                <label className="block text-[10px] text-slate-400 font-bold mb-1">임계 속도 필터 범위</label>
+                <select 
+                  value={maxSpeedKts} 
+                  onChange={(e) => setMaxSpeedKts(Number(e.target.value))}
+                  className="w-full text-xs font-mono bg-slate-900 text-slate-400 border border-slate-800 rounded px-2 py-1.5 focus:border-teal-500 focus:outline-none"
+                >
+                  <option value="15">Max 15 kts</option>
+                  <option value="30">Max 30 kts</option>
+                  <option value="40">Max 40 kts (기본)</option>
+                  <option value="60">Max 60 kts</option>
+                </select>
+              </div>
             </div>
 
-            {/* CUSTOM DATA SECTION */}
-            <div className="p-2.5 rounded border border-border-theme bg-panel-theme/30">
-              <div className="flex items-center justify-between gap-2 mb-2">
-                <span className="text-xs font-bold text-slate-300 flex items-center gap-1">
-                  <PlusCircle className="w-3 h-3 text-accent-theme" />
-                  실제 CSV 주입구 (직접 업로드 / 붙여넣기)
+            {fileName && (
+              <div className="bg-slate-900/60 rounded px-3 py-2 border border-slate-800 flex items-center justify-between">
+                <div className="flex items-center gap-2 min-w-0">
+                  <FileCheck className="w-3.5 h-3.5 text-teal-400 shrink-0" />
+                  <span className="text-[10px] font-mono text-slate-300 truncate" title={fileName}>
+                    {fileName}
+                  </span>
+                </div>
+                <span className="text-[9px] font-mono bg-slate-800 text-slate-500 px-1.5 py-0.5 rounded shrink-0">
+                  {parsedRows.length + 1} Rows
                 </span>
-                {useCustomData && (
-                  <span className="text-[9px] font-mono bg-accent-theme/10 text-accent-theme border border-accent-theme/20 px-1.5 py-0.5 rounded-sm font-bold">ACTIVE</span>
+              </div>
+            )}
+
+            {/* PRE-CONSTRUCTED DEMO TRIGGER */}
+            <div className="space-y-1.5 pt-1">
+              <span className="block text-[9px] font-bold text-slate-500 uppercase tracking-widest">웹 프리패키지 테스트 샘플 적재</span>
+              <div className="flex flex-col gap-2">
+                <button 
+                  onClick={loadDemoA} 
+                  className="w-full text-left bg-slate-900 hover:bg-slate-800 border border-slate-800 px-3 py-2 rounded text-xs flex flex-col justify-between transition-colors group"
+                >
+                  <span className="font-semibold text-teal-400 flex items-center gap-1">
+                    <Activity className="w-3 h-3 text-teal-400" />
+                    샘플 A 로드 (항로 예측 모드)
+                  </span>
+                  <span className="text-[9px] text-slate-500 mt-0.5 group-hover:text-slate-400 transition-colors">
+                    연속 위경도 좌표 포함 및 지오펜스 무단 선회 감시
+                  </span>
+                </button>
+                <button 
+                  onClick={loadDemoB} 
+                  className="w-full text-left bg-slate-900 hover:bg-slate-800 border border-slate-800 px-3 py-2 rounded text-xs flex flex-col justify-between transition-colors group"
+                >
+                  <span className="font-semibold text-amber-500 flex items-center gap-1">
+                    <AlertTriangle className="w-3 h-3 text-amber-500" />
+                    샘플 B 로드 (제원 이상치 감시 모드)
+                  </span>
+                  <span className="text-[9px] text-slate-500 mt-0.5 group-hover:text-slate-400 transition-colors">
+                    위경도가 유실된 한국어 컬럼 제원 전용 이상값 감시
+                  </span>
+                </button>
+              </div>
+            </div>
+          </div>
+
+          {/* SEC 2: DIAGNOSTIC RECAP METRICS */}
+          {diagnostic && (
+            <div className="p-5 space-y-4">
+              <div className="flex items-center gap-1.5">
+                <span className="text-[10px] font-mono font-bold bg-teal-500 text-slate-900 w-5 h-5 rounded flex items-center justify-center">2</span>
+                <span className="text-xs font-bold text-slate-200">CSV 품질 구조 진단 파악</span>
+              </div>
+
+              {/* INTEGRITY SCORE CARD WITH DONUT */}
+              <div className="bg-slate-900/30 rounded-lg p-3.5 border border-slate-800/80 flex items-center justify-between gap-4">
+                <div className="space-y-1 min-w-0">
+                  <span className="text-[10px] text-slate-500 font-bold uppercase tracking-wider block">종합 데이터 신뢰 점수</span>
+                  <div className="flex items-baseline gap-1.5">
+                    <span className="text-2xl font-bold font-mono tracking-tight text-white">{diagnostic.qualityScore}</span>
+                    <span className="text-xs text-slate-500">/ 100 점</span>
+                  </div>
+                  <p className="text-[10px] text-slate-400 leading-snug">
+                    {diagnostic.qualityScore >= 85 ? '🟢 정교한 예측 연산이 가능한 청정 세정 등급입니다.' :
+                     diagnostic.qualityScore >= 60 ? '🟡 누락치와 무수신 에러 가공이 다수 필요합니다.' :
+                     '🔴 위경도가 누락되었거나 비정상 극값이 심각하게 많습니다.'}
+                  </p>
+                </div>
+
+                {/* SVG DONUT CHART */}
+                <div className="relative w-16 h-16 shrink-0">
+                  <svg className="w-full h-full transform -rotate-90" viewBox="0 0 36 36">
+                    <path
+                      className="text-slate-800"
+                      strokeWidth="3.5"
+                      stroke="currentColor"
+                      fill="none"
+                      d="M18 2.0845 a 15.9155 15.9155 0 0 1 0 31.831 a 15.9155 15.9155 0 0 1 0 -31.831"
+                    />
+                    <path
+                      className={
+                        diagnostic.qualityScore >= 85 ? 'text-teal-400' :
+                        diagnostic.qualityScore >= 60 ? 'text-amber-500' :
+                        'text-rose-500'
+                      }
+                      strokeWidth="3.5"
+                      strokeDasharray={`${diagnostic.qualityScore}, 100`}
+                      strokeLinecap="round"
+                      stroke="currentColor"
+                      fill="none"
+                      d="M18 2.0845 a 15.9155 15.9155 0 0 1 0 31.831 a 15.9155 15.9155 0 0 1 0 -31.831"
+                    />
+                  </svg>
+                  <div className="absolute inset-0 flex items-center justify-center font-mono text-xs font-semibold text-slate-300">
+                    {diagnostic.qualityScore}%
+                  </div>
+                </div>
+              </div>
+
+              {/* AUTOMATIC MODE ROUTER PANEL */}
+              <div className={`p-3 rounded border text-xs leading-relaxed ${
+                diagnostic.isPredictable 
+                  ? 'bg-emerald-500/5 border-emerald-500/20 text-emerald-300' 
+                  : 'bg-amber-500/5 border-amber-500/20 text-amber-300'
+              }`}>
+                <div className="font-bold flex items-center gap-1.5 mb-1 text-sm">
+                  {diagnostic.isPredictable ? (
+                    <>
+                      <Shield className="w-4 h-4 text-emerald-400 shrink-0" />
+                      [모드 A] 항로 예측 가능 모드 구동
+                    </>
+                  ) : (
+                    <>
+                      <AlertTriangle className="w-4 h-4 text-amber-500 shrink-0" />
+                      [모드 B] 예측제약 데이터 품질 모드 분기
+                    </>
+                  )}
+                </div>
+                {diagnostic.isPredictable ? (
+                  "데이터상 필수 선박고유키와 위경도 물리 좌표가 모두 식별되었습니다. 관치 궤적 및 2차 관성 보간 자율예측 경보 시스템이 완벽하게 가동됩니다."
+                ) : (
+                  "위치 경위도 컬럼이 누락되었거나 일관된 데이터 셋이 유실되어 항로 예측 불가로 판정되었습니다. 대신 한국 AIS 무수신에 대표적으로 기록된 한글 이상치 모니터 감시를 구동합니다."
                 )}
               </div>
 
-              {/* CSV Upload tool */}
-              <label className="flex items-center justify-center gap-2 w-full border border-dashed border-border-theme hover:border-accent-theme/40 hover:bg-panel-theme/50 p-2 rounded cursor-pointer text-xs font-mono text-slate-400 transition-all mb-2">
-                <Upload className="w-3.5 h-3.5 text-slate-500" />
-                <span>로컬 CSV 파일 주입...</span>
-                <input 
-                  type="file" 
-                  accept=".csv,.txt" 
-                  onChange={handleFileUpload} 
-                  className="hidden" 
-                />
-              </label>
+              {/* RECOGNIZED CHANNELS */}
+              <div className="space-y-1.5">
+                <span className="block text-[10px] text-slate-500 font-bold uppercase tracking-wider">자동 맵핑 성공한 수집 칼럼 ({diagnostic.mappedColumns.length}개)</span>
+                <div className="flex flex-wrap gap-1">
+                  {diagnostic.mappedColumns.map(col => (
+                    <span key={col.key} className="text-[9px] font-mono bg-slate-900 border border-slate-800 text-teal-400 px-2 py-0.5 rounded leading-none">
+                      {col.key} → {col.header}
+                    </span>
+                  ))}
+                  {diagnostic.missingRequiredColumns.map(col => (
+                    <span key={col} className="text-[9px] font-mono bg-rose-950/20 border border-rose-500/20 text-rose-400 px-2 py-0.5 rounded leading-none flex items-center gap-0.5">
+                      ❌ {col} 누락
+                    </span>
+                  ))}
+                </div>
+              </div>
+            </div>
+          )}
 
-              {/* Switch to custom manually */}
-              <button
-                id="use-custom-csv-btn"
-                onClick={() => {
-                  setUseCustomData(true);
-                  setSystemLogs(l => [...l, `[수동] 주입된 CSV 버퍼 데이터로 모니터링 전환 완료`]);
-                }}
-                className={`w-full py-1.5 px-3 rounded text-center text-xs font-semibold border transition-all font-mono tracking-wider ${
-                  useCustomData 
-                    ? 'bg-accent-theme/10 text-accent-theme border-accent-theme/40 font-bold'
-                    : 'bg-panel-theme/40 hover:bg-panel-theme hover:text-white text-slate-400 border-border-theme'
-                }`}
-              >
-                주입된 CSV 데이터 분석기 가동
-              </button>
+          {/* SEC 3: SYSTEM CONSOLE STREAM */}
+          <div className="grow flex flex-col min-h-[220px]">
+            <div className="p-4 bg-slate-950 border-b border-slate-900 flex items-center justify-between shrink-0">
+              <span className="text-[10px] font-bold text-slate-500 tracking-wider flex items-center gap-1">
+                <Terminal className="w-3.5 h-3.5 text-teal-400" />
+                시스템 실시간 추적 기록
+              </span>
+              <span className="text-[9px] font-mono text-slate-600">LIVE SHELL</span>
+            </div>
+            
+            <div className="grow overflow-y-auto bg-[#04070c] p-4 font-mono text-[10px] text-emerald-400/80 space-y-1.5 custom-scrollbar select-none leading-relaxed">
+              {consoleLogs.length === 0 ? (
+                <p className="text-slate-600 italic">감시 시뮬레이션 관련 신호 대기 중...</p>
+              ) : (
+                consoleLogs.map((log, idx) => (
+                  <p key={idx} className={idx === 0 ? "text-emerald-300 font-bold border-l-2 border-emerald-400 pl-1.5 animate-pulse" : "text-emerald-600/70"}>
+                    {log}
+                  </p>
+                ))
+              )}
             </div>
           </div>
 
-          {/* STEP 2: ML TUNING & OUTLIER SETTINGS SLIDERS */}
-          <div className="p-4 border-b border-border-theme bg-panel-theme/10 mb-auto">
-            <div className="flex items-center gap-2 mb-4">
-              <span className="text-[10px] font-mono font-bold bg-accent-theme text-bg-theme w-5 h-5 rounded flex items-center justify-center shadow-md">2</span>
-              <h2 className="text-xs font-bold text-white uppercase tracking-wider font-display">지능형 오염 감시 알고리즘 설정</h2>
-            </div>
+        </div>
 
-            <div className="space-y-4">
-              {/* SLIDER 1: SOG Noise Filter limit */}
-              <div>
-                <div className="flex justify-between items-center text-xs text-slate-400 mb-1.5">
-                  <span className="flex items-center gap-1 font-medium text-slate-300">
-                    <Info className="w-3.5 h-3.5 text-accent-theme" />
-                    전처리 단계: 비정상 데이터 필터링 속도 (최대 40노트)
-                  </span>
-                  <span className="font-mono text-accent-theme font-bold">{maxSpeedKts} kts</span>
-                </div>
-                <input
-                  type="range"
-                  min="15"
-                  max="60"
-                  value={maxSpeedKts}
-                  onChange={(e) => {
-                    setMaxSpeedKts(Number(e.target.value));
-                    setSystemLogs(l => [...l, `[파라미터 변경] 최대 속도 필터 기준치: ${e.target.value}kts`]);
-                  }}
-                  className="w-full h-1.5 bg-border-theme rounded appearance-none cursor-pointer accent-accent-theme"
-                />
-                <p className="text-[10px] text-slate-500 mt-1">
-                  지정 속력 {maxSpeedKts} kts를 초과하는 수치는 송수신 에러 및 비현실적인 기형 노이즈로 간주하고 여과 처리합니다.
-                </p>
-              </div>
-
-              {/* SLIDER 2: Turn Rate COG Anomaly trigger */}
-              <div>
-                <div className="flex justify-between items-center text-xs text-slate-400 mb-1.5">
-                  <span className="flex items-center gap-1 font-medium text-slate-300">
-                    <Compass className="w-3.5 h-3.5 text-amber-400" />
-                    오염 의심 기준: 5분간 급격한 방향 전환 각도 (45°)
-                  </span>
-                  <span className="font-mono text-amber-400 font-bold">±{anomalyCofThreshold}°</span>
-                </div>
-                <input
-                  type="range"
-                  min="20"
-                  max="90"
-                  value={anomalyCofThreshold}
-                  onChange={(e) => {
-                    setAnomalyCofThreshold(Number(e.target.value));
-                    setSystemLogs(l => [...l, `[파라미터 변경] 방향 급회전 기준각: ±${e.target.value}°`]);
-                  }}
-                  className="w-full h-1.5 bg-border-theme rounded appearance-none cursor-pointer accent-accent-theme"
-                />
-                <p className="text-[10px] text-slate-500 mt-1">
-                  5분 동안 선박 항로 방향이 {anomalyCofThreshold}도 이상 급변경될 시 비정상 회운 기동으로 식별해 오염 가능성 경보를 울립니다.
-                </p>
-              </div>
-
-              {/* SLIDER 3: ML History Lags used */}
-              <div>
-                <div className="flex justify-between items-center text-xs text-slate-400 mb-1.5">
-                  <span className="flex items-center gap-1 font-medium text-slate-300">
-                    <Clock className="w-3.5 h-3.5 text-slate-500" />
-                    인공지능이 참고할 과거 위치 기억 데이터 개수
-                  </span>
-                  <span className="font-mono text-slate-500 font-bold">{lagSteps}개 지점</span>
-                </div>
-                <input
-                  type="range"
-                  min="1"
-                  max="3"
-                  value={lagSteps}
-                  disabled
-                  className="w-full h-1.5 bg-border-theme rounded appearance-none opacity-40 cursor-not-allowed accent-gray-500"
-                />
-                <p className="text-[10px] text-slate-500 mt-1">
-                  직전 2회분(t-1, t-2) 선박 위치 이력을 실시간 인공지능이 기억하여 연속 운항 추적 알고리즘에 활용합니다.
-                </p>
-              </div>
-
-              {/* SLIDER 4: XGBoost / LightGBM Estimators */}
-              <div>
-                <div className="flex justify-between items-center text-xs text-slate-400 mb-1.5">
-                  <span className="flex items-center gap-1 font-medium text-slate-300">
-                    <Cpu className="w-3.5 h-3.5 text-cyan-400" />
-                    인공지능 가상 탐색 경로 수 (정밀도)
-                  </span>
-                  <span className="font-mono text-cyan-400 font-bold">{xgboostEstimators} 조합</span>
-                </div>
-                <input
-                  type="range"
-                  min="50"
-                  max="300"
-                  step="50"
-                  value={xgboostEstimators}
-                  onChange={(e) => {
-                    setXgboostEstimators(Number(e.target.value));
-                    setSystemLogs(l => [...l, `[파라미터 변경] 예측 시뮬레이션 탐색 규모: ${e.target.value}개`]);
-                  }}
-                  className="w-full h-1.5 bg-border-theme rounded appearance-none cursor-pointer accent-accent-theme"
-                />
-                <p className="text-[10px] text-slate-500 mt-1">
-                  인공지능 시뮬레이션의 가상 예측 갈래 수를 정밀하게 조합하여, 굴곡이 불규칙한 해해안선 오차를 최소화합니다.
-                </p>
-              </div>
-            </div>
-          </div>
-
-          {/* ACTIVE VESSEL INFO SUMMARY CARD */}
-          <div className="p-4 border-t border-slate-900 bg-slate-950/80 w-full select-none mt-auto">
-            <h3 className="text-xs font-bold text-slate-300 flex items-center gap-1.5 mb-1.5">
-              <Info className="w-3.5 h-3.5 text-indigo-400" />
-              모니터링 대상 정보
-            </h3>
-            <div className="text-xs bg-slate-900/60 p-2 text-slate-300 rounded-lg border border-slate-900 space-y-1">
-              <div className="font-bold text-slate-100">{currentVesselData.name}</div>
-              <div className="text-[10px] text-slate-400 font-mono">선종: {currentVesselData.type}</div>
-              <div className="text-[10px] text-slate-400 font-mono">데이터 상태: {cleaningResult.removed.length > 0 ? `노이즈 ${cleaningResult.removed.length}건 정화됨` : "결측 정비 완료"}</div>
-              <div className="text-[10px] text-slate-500 italic leading-relaxed py-1.5 border-t border-slate-800 mt-1.5">
-                {currentVesselData.description}
-              </div>
-            </div>
-          </div>
-
-        </section>
-
-        {/* CENTER COLUMN: GIS MAP PLOTTER & VISUAL METRIC CONTROL */}
-        <main className="xl:col-span-9 bg-slate-950 flex flex-col min-h-0 overflow-y-auto xl:overflow-hidden max-h-[calc(100vh-73px)]">
+        {/* RIGHT COMPONENT: MAIN VIEW STRETCH */}
+        <div className="grow bg-[#05080e] flex flex-col overflow-y-auto relative custom-scrollbar">
           
-          {/* VIEW / TAB SELECTION PANELS */}
-          <div className="border-b border-slate-900 bg-slate-900/40 px-6 py-2 flex flex-col sm:flex-row items-center justify-between gap-3 shrink-0">
-            <div className="flex bg-slate-950/80 border border-slate-800 p-0.5 rounded-lg w-full sm:w-auto">
-              {/* TAB 1: GIS Radar plotter */}
-              <button
-                id="tab-radar"
-                onClick={() => setActiveTab('radar')}
-                className={`flex-1 sm:flex-none flex items-center justify-center gap-2 px-4 py-1.5 rounded-md text-xs font-semibold tracking-wider uppercase transition-all ${
-                  activeTab === 'radar' 
-                    ? 'bg-gradient-to-r from-teal-500/10 to-sky-500/10 border border-teal-500/30 text-teal-400' 
-                    : 'text-slate-400 border border-transparent hover:text-slate-200'
-                }`}
-              >
-                <MapIcon className="w-3.5 h-3.5" />
-                선박 관제 레이더
-              </button>
-
-              {/* TAB 2: Features table proofing */}
-              <button
-                id="tab-features"
-                onClick={() => setActiveTab('features')}
-                className={`flex-1 sm:flex-none flex items-center justify-center gap-2 px-4 py-1.5 rounded-md text-xs font-semibold tracking-wider uppercase transition-all ${
-                  activeTab === 'features' 
-                    ? 'bg-gradient-to-r from-teal-500/10 to-sky-500/10 border border-teal-500/30 text-teal-400' 
-                    : 'text-slate-400 border border-transparent hover:text-slate-200'
-                }`}
-              >
-                <Database className="w-3.5 h-3.5" />
-                시계열 지연(Lag) 변수 검증기
-              </button>
-            </div>
-
-            {/* MAP CONFIG CONTROLS (Only visible on radar tab) */}
-            {activeTab === 'radar' && (
-              <div className="flex flex-wrap items-center gap-3">
-                <label className="flex items-center gap-1.5 text-xs text-slate-400 cursor-pointer">
-                  <input 
-                    type="checkbox" 
-                    checked={showRestrictedZone} 
-                    onChange={() => setShowRestrictedZone(!showRestrictedZone)} 
-                    className="rounded border-slate-700 bg-slate-900 text-teal-500 focus:ring-0 focus:ring-offset-0"
-                  />
-                  산호초 보호구역(Geofence) 경계 표시
-                </label>
-                <label className="flex items-center gap-1.5 text-xs text-slate-400 cursor-pointer">
-                  <input 
-                    type="checkbox" 
-                    checked={showPredictedPath} 
-                    onChange={() => setShowPredictedPath(!showPredictedPath)} 
-                    className="rounded border-slate-700 bg-slate-900 text-teal-500 focus:ring-0 focus:ring-offset-0"
-                  />
-                  인공지능 안전 예측 경로 표시
-                </label>
-                <label className="flex items-center gap-1.5 text-xs text-slate-400 cursor-pointer">
-                  <input 
-                    type="checkbox" 
-                    checked={showRawDottedLine} 
-                    onChange={() => setShowRawDottedLine(!showRawDottedLine)} 
-                    className="rounded border-slate-700 bg-slate-900 text-teal-500 focus:ring-0 focus:ring-offset-0"
-                  />
-                  노이즈 원천궤적 복구
-                </label>
-              </div>
-            )}
-          </div>
-
-          <div className="grow flex flex-col min-h-0 overflow-y-auto xl:overflow-hidden select-none">
-            {activeTab === 'radar' && (
-              <div className="grow grid grid-cols-1 xl:grid-cols-4 min-h-0">
-                {/* 1. INTERACTIVE MAPPING RADAR CONTAINER */}
-                <div className="xl:col-span-3 flex flex-col relative bg-slate-950 border-b xl:border-b-0 xl:border-r border-slate-900 min-h-[460px] xl:min-h-0">
+          {activeTab === 'dashboard' ? (
+            <>
+              {!diagnostic ? (
+                <div className="flex-1 flex flex-col items-center justify-center p-8 h-[600px] text-center">
+                  <div className="animate-spin rounded-full h-8 w-8 border-t-2 border-b-2 border-teal-400 mb-3 mx-auto"></div>
+                  <p className="text-xs text-slate-400">선박 항로 레이더 전처리 데이터를 분석 중입니다...</p>
+                </div>
+              ) : diagnostic.isPredictable ? (
+                // ==========================================
+                // [MODE A] PREDICTABLE TRACK FORECASTER
+                // ==========================================
+                <div className="p-6 space-y-6">
                   
-                  {/* PLAYBACK & ANIMATION CONTROLLER FLOATER */}
-                  <div className="absolute top-4 left-4 z-20 flex items-center gap-2 bg-slate-950/90 backdrop-blur-md px-3.5 py-2 rounded-xl border border-slate-800 shadow-2xl">
-                    <button
-                      id="play-simulation-btn"
-                      onClick={() => {
-                        setIsAnimating(!isAnimating);
-                        setSystemLogs(l => [...l, isAnimating ? `[시뮬레이터] 주행 일시 정지` : `[시뮬레이터] 순차 이상 감시 실시간 재생 시작 (배속: ${playbackSpeed}x)`]);
-                      }}
-                      className={`p-2 rounded-lg flex items-center justify-center transition-all ${
-                        isAnimating 
-                          ? 'bg-rose-500/20 text-rose-400 border border-rose-500/30' 
-                          : 'bg-teal-500/10 text-teal-400 border border-teal-500/30 hover:bg-teal-500/20'
-                      }`}
-                      title={isAnimating ? "일시정지" : "시나리오 재생"}
-                    >
-                      {isAnimating ? <Pause className="w-4 h-4" /> : <Play className="w-4 h-4 ml-0.5" />}
-                    </button>
-
-                    <button
-                      id="reset-simulation-btn"
-                      onClick={() => {
-                        setCurrentPlayIdx(0);
-                        setIsAnimating(false);
-                        setSystemLogs(l => [...l, `[시뮬레이터] 관제 이력 인덱스 초기화`]);
-                      }}
-                      className="p-2 rounded-lg bg-slate-900 border border-slate-800 text-slate-400 hover:text-slate-200 transition-all"
-                      title="주행 초기화"
-                    >
-                      <RotateCcw className="w-4 h-4" />
-                    </button>
-
-                    <span className="w-px h-6 bg-slate-800" />
-
-                    <div className="flex flex-col">
-                      <span className="text-[10px] text-slate-400 font-bold leading-none uppercase">실시간 항해 시뮬레이션 재생</span>
-                      <span className="text-xs font-mono font-bold text-white mt-0.5">
-                        {currentPlayIdx + 1 < 10 ? `0${currentPlayIdx + 1}` : currentPlayIdx + 1} / {cleaningResult.cleaned.length < 10 ? `0${cleaningResult.cleaned.length}` : cleaningResult.cleaned.length} Pts
-                      </span>
+                  {/* METRIC RIBBON */}
+                  <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
+                    <div className="bg-[#090f19] border border-slate-800 p-4 rounded-lg">
+                      <span className="text-[10px] text-slate-500 uppercase tracking-widest font-mono font-bold leading-none block">총 식별 실선 선박량</span>
+                      <span className="text-2xl font-bold text-white mt-1.5 block font-mono">{diagnostic.totalVessels} 척</span>
                     </div>
-
-                    <span className="w-px h-6 bg-slate-800" />
-
-                    {/* Speeds Controls */}
-                    <div className="flex items-center gap-1.5">
-                      {[1, 2, 4].map(s => (
-                        <button
-                          key={s}
-                          onClick={() => setPlaybackSpeed(s)}
-                          className={`px-2 py-0.5 rounded text-[10px] font-mono border transition-all ${
-                            playbackSpeed === s
-                              ? 'bg-teal-500 text-slate-950 font-bold border-teal-400'
-                              : 'bg-slate-900 text-slate-400 border-slate-800 hover:text-white'
-                          }`}
-                        >
-                          {s}x
-                        </button>
-                      ))}
+                    <div className="bg-[#090f19] border border-slate-800 p-4 rounded-lg">
+                      <span className="text-[10px] text-slate-500 uppercase tracking-widest font-mono font-bold leading-none block">시계열 연속 행 수</span>
+                      <span className="text-2xl font-bold text-teal-400 mt-1.5 block font-mono">{diagnostic.totalRecords} 행</span>
+                    </div>
+                    <div className="bg-[#090f19] border border-slate-800 p-4 rounded-lg">
+                      <span className="text-[10px] text-slate-500 uppercase tracking-widest font-mono font-bold leading-none block">오염 의심 급선회 기준</span>
+                      <span className="text-2xl font-bold text-amber-500 mt-1.5 block font-mono">±{anomalyCofThreshold}° / 5m</span>
+                    </div>
+                    <div className="bg-[#090f19] border border-slate-800 p-4 rounded-lg">
+                      <span className="text-[10px] text-slate-500 uppercase tracking-widest font-mono font-bold leading-none block">산호초 구역 안전 한계</span>
+                      <span className="text-2xl font-bold text-rose-500 mt-1.5 block font-mono">기본 3.0 km</span>
                     </div>
                   </div>
 
-                  {/* ZOOM / MOVEMENT CONTROL MODULE */}
-                  <div className="absolute top-4 right-4 z-20 flex flex-col gap-1.5 bg-slate-900/90 backdrop-blur border border-slate-800 p-1.5 rounded-lg">
-                    <button
-                      onClick={() => setZoomLevel(z => Math.min(4, z + 0.2))}
-                      className="w-8 h-8 flex items-center justify-center font-bold text-lg bg-slate-950 hover:bg-slate-800 text-slate-300 rounded border border-slate-800 transition-all"
-                      title="확대"
-                    >
-                      +
-                    </button>
-                    <button
-                      onClick={() => setZoomLevel(z => Math.max(0.6, z - 0.2))}
-                      className="w-8 h-8 flex items-center justify-center font-bold text-lg bg-slate-950 hover:bg-slate-800 text-slate-300 rounded border border-slate-800 transition-all"
-                      title="축소"
-                    >
-                      -
-                    </button>
-                    <button
-                      onClick={resetMapMatrix}
-                      className="w-8 h-8 flex items-center justify-center bg-slate-950 hover:bg-slate-800 text-slate-400 rounded border border-slate-800 transition-all"
-                      title="중앙 리셋"
-                    >
-                      <Globe className="w-4 h-4" />
-                    </button>
-                  </div>
-
-                  {/* MAP VIEWPORT CONTAINER SVG ELEMENT */}
-                  <div className="grow w-full h-full min-h-[380px] select-none relative bg-slate-950 text-slate-100 flex items-center justify-center overflow-hidden">
-                    <svg
-                      viewBox="0 0 100 100"
-                      preserveAspectRatio="none"
-                      className="absolute inset-0 w-full h-full cursor-crosshair"
-                      onMouseMove={handleMapMouseMove}
-                      onMouseLeave={() => setMapCursorLatLng(null)}
-                    >
-                      {/* Grid background lines */}
-                      <g stroke="#1e293b" strokeWidth="0.08" strokeDasharray="3,3">
-                        {Array.from({ length: 11 }).map((_, i) => (
-                          <line key={`lh-${i}`} x1="0" y1={i * 10} x2="100" y2={i * 10} />
-                        ))}
-                        {Array.from({ length: 11 }).map((_, i) => (
-                          <line key={`lv-${i}`} x1={i * 10} y1="0" x2={i * 10} y2="100" />
-                        ))}
-                      </g>
-
-                      {/* Map coordinate axis markers */}
-                      <g className="text-[2px] font-mono fill-slate-700 tracking-wider">
-                        {Array.from({ length: 5 }).map((_, i) => {
-                          const lon = mapBounds.minLon + (i / 4) * (mapBounds.maxLon - mapBounds.minLon);
-                          const lat = mapBounds.minLat + (i / 4) * (mapBounds.maxLat - mapBounds.minLat);
-                          return (
-                            <React.Fragment key={`axis-${i}`}>
-                              <text x={i * 25 + 1} y="98">{lon.toFixed(2)}°E</text>
-                              <text x="1" y={(1 - i / 4) * 96 + 3}>{lat.toFixed(2)}°N</text>
-                            </React.Fragment>
-                          );
-                        })}
-                      </g>
-
-                      {/* LAND ISLAND MASSES (Simulated Korean Coast boundary layout mapping) */}
-                      <path
-                        d="M -10,30 Q 15,28 30,5 Q 40,-10 60,-10 C 70,5 82,2 96,-15 L 120,-10 L 120,120 L -10,120 Z"
-                        fill="#091124"
-                        stroke="#1e293b"
-                        strokeWidth="0.3"
-                        opacity="0.85"
-                      />
-
-                      {/* Dynamic Landmark Points */}
-                      {landMarks.map((lm, idx) => {
-                        const coords = getSvgCoordinates(lm.lat, lm.lon);
-                        return (
-                          <g key={`lm-${idx}`}>
-                            <circle cx={coords.x} cy={coords.y} r="0.4" fill="#64748b" opacity="0.6" />
-                            <text 
-                              x={coords.x + 0.9} 
-                              y={coords.y + 0.4} 
-                              className="text-[1.8px] font-mono fill-slate-400 select-none pointer-events-none tracking-widest uppercase"
-                            >
-                              {lm.name}
-                            </text>
-                          </g>
-                        );
-                      })}
-
-                      {/* MILITARY CLOSED GEOFENCED HIGH-RISK BOX ALARM REGION */}
-                      {showRestrictedZone && (
-                        <g>
-                          <polygon
-                            points={restrictedAreaPointsStr}
-                            fill="rgba(239, 68, 68, 0.08)"
-                            stroke="#ef4444"
-                            strokeWidth="0.35"
-                            strokeDasharray="1,1"
-                          />
-                          <text
-                            x={getSvgCoordinates(34.82, 129.505).x}
-                            y={getSvgCoordinates(34.82, 129.505).y}
-                            textAnchor="middle"
-                            className="text-[1.8px] font-semibold fill-red-400 font-display tracking-widest uppercase animate-pulse"
-                          >
-                            ⚠️ 부산통제구역 (훈련 해역)
-                          </text>
-                        </g>
-                      )}
-
-                      {/* CORAL REEF PROTECTED GEOFENCE - HAZARD AREA */}
-                      {showRestrictedZone && (
-                        <g>
-                          <circle
-                            cx={getSvgCoordinates(34.68, 129.04).x}
-                            cy={getSvgCoordinates(34.68, 129.04).y}
-                            r={5.5 * zoomLevel}
-                            fill="rgba(244, 63, 94, 0.06)"
-                            stroke="#f43f5e"
-                            strokeWidth="0.3"
-                            strokeDasharray="2,2"
-                          />
-                          <text
-                            x={getSvgCoordinates(34.68, 129.04).x}
-                            y={getSvgCoordinates(34.68, 129.04).y}
-                            textAnchor="middle"
-                            className="text-[1.8px] font-semibold fill-rose-400 font-display tracking-wide uppercase animate-pulse"
-                          >
-                            ⚠️ 산호초 보호 구역 (위험 지대)
-                          </text>
-                        </g>
-                      )}
-
-                      {/* 1. ORIGINAL RAW PATH TRAILS (DOTTED GRAY WITH HIGH TEMPERATURE DEVIATION) */}
-                      {showRawDottedLine && (
-                        <g>
-                          <polyline
-                            points={svgLines.rawSvg.map(p => `${p.x},${p.y}`).join(" ")}
-                            fill="none"
-                            stroke="#475569"
-                            strokeWidth="0.25"
-                            strokeDasharray="2,2"
-                            opacity="0.7"
-                          />
-                          {svgLines.rawSvg.map((p, idx) => (
-                            <circle
-                              key={`raw-${idx}`}
-                              cx={p.x}
-                              cy={p.y}
-                              r="0.55"
-                              fill="#334155"
-                              stroke="#64748b"
-                              strokeWidth="0.1"
-                              opacity="0.6"
-                              className="cursor-pointer hover:scale-150 transition-transform"
-                              onMouseEnter={() => setHoveredPoint({ ...p, index: idx })}
-                              onMouseLeave={() => setHoveredPoint(null)}
-                            />
-                          ))}
-                        </g>
-                      )}
-
-                      {/* 2. CHOSEN CLEAN PREPROCESSED PATH TRAILING (SOLID HIGHLIGHT CYAN) */}
-                      <g>
-                        <polyline
-                          points={svgLines.preproSvg.map(p => `${p.x},${p.y}`).join(" ")}
-                          fill="none"
-                          stroke="#14b8a6"
-                          strokeWidth="0.45"
-                        />
-                        {svgLines.preproSvg.map((p, idx) => {
-                          const isAnimatedPosition = idx === currentPlayIdx;
-                          const hasLocalAnomaly = anomaliesList.some(a => a.timestamp === p.timestamp && a.type !== 'NOISE_FILTERED');
-                          
-                          return (
-                            <g key={`clean-${idx}`}>
-                              {/* Glowing pulsators for selected playback or local anomalies */}
-                              {isAnimatedPosition && (
-                                <circle
-                                  cx={p.x}
-                                  cy={p.y}
-                                  r="2"
-                                  className="fill-teal-400/20 stroke-teal-300 stroke-[0.1] origin-center scale-150 animate-radar-ring"
-                                />
-                              )}
-                              
-                              {hasLocalAnomaly && (
-                                <circle
-                                  cx={p.x}
-                                  cy={p.y}
-                                  r="2.5"
-                                  className="fill-red-500/10 stroke-rose-500 stroke-[0.1] origin-center animate-radar-ring"
-                                />
-                              )}
-
-                              <circle
-                                cx={p.x}
-                                cy={p.y}
-                                r={isAnimatedPosition ? "1.0" : "0.65"}
-                                fill={hasLocalAnomaly ? "#ef4444" : isAnimatedPosition ? "#2dd4bf" : "#0d9488"}
-                                stroke={isAnimatedPosition ? "#ffffff" : "#0f172a"}
-                                strokeWidth="0.15"
-                                className="cursor-pointer transition-all hover:scale-150 hover:fill-teal-300"
-                                onMouseEnter={() => setHoveredPoint({ ...p, index: idx })}
-                                onMouseLeave={() => setHoveredPoint(null)}
-                              />
-                            </g>
-                          );
-                        })}
-                      </g>
-
-                      {/* 3. MACHINE LEARNING (XGBOOST/LIGHTGBM) EXPECTATION PATH PREDICTIONS (GOLD LINES) */}
-                      {showPredictedPath && (
-                        <g>
-                          {svgLines.predSvg.map((p, idx) => {
-                            // Only draw predictions up to active playback point to show look-ahead mechanism
-                            if (idx > currentPlayIdx) return null;
-                            const isNewest = idx === currentPlayIdx;
-
-                            return (
-                              <g key={`pred-${idx}`}>
-                                {/* Line pointing from actual current position to modeled next coordinate */}
-                                <line
-                                  x1={svgLines.preproSvg[idx]?.x}
-                                  y1={svgLines.preproSvg[idx]?.y}
-                                  x2={p.pred.x}
-                                  y2={p.pred.y}
-                                  stroke="#eab308"
-                                  strokeWidth="0.32"
-                                  strokeDasharray="1.2,1.2"
-                                  opacity="0.8"
-                                />
-
-                                {/* Predicted Target node */}
-                                <g transform={`translate(${p.pred.x}, ${p.pred.y})`}>
-                                  <line x1="-0.8" y1="0" x2="0.8" y2="0" stroke="#f59e0b" strokeWidth="0.15" />
-                                  <line x1="0" y1="-0.8" x2="0" y2="0.8" stroke="#f59e0b" strokeWidth="0.15" />
-                                  <circle cx="0" cy="0" r="0.42" fill="none" stroke="#f59e0b" strokeWidth="0.15" />
-                                </g>
-
-                                {/* If youngest lookahead prediction, display beautiful warning indicators if distance deviates */}
-                                {isNewest && p.error_distance_m > 480 && (
-                                  <g transform={`translate(${p.pred.x + 2.5}, ${p.pred.y - 1})`}>
-                                    <rect x="-5" y="-1.5" width="34" height="2.5" rx="0.4" fill="rgba(15, 23, 42, 0.95)" stroke="#f59e0b" strokeWidth="0.1" />
-                                    <text x="-4" y="0.2" className="text-[1.1px] fill-amber-300 font-semibold font-sans">
-                                      ⚠️ 인공지능 경고: 정상 항로에서 {p.error_distance_m}m 이탈 발생!
-                                    </text>
-                                  </g>
-                                )}
-                              </g>
-                            );
-                          })}
-                        </g>
-                      )}
-
-                      {/* ACTIVE SAILING VESSEL VECTOR ICON SYMBOLS ON MAP */}
-                      {svgLines.preproSvg[currentPlayIdx] && (
-                        <g transform={`translate(${svgLines.preproSvg[currentPlayIdx].x}, ${svgLines.preproSvg[currentPlayIdx].y}) rotate(${svgLines.preproSvg[currentPlayIdx].cog})`}>
-                          <polygon
-                            points="0,-2.5 1.4,1.8 0,0.8 -1.4,1.8"
-                            fill="#ffffff"
-                            stroke="#0f172a"
-                            strokeWidth="0.25"
-                            className="shadow-2xl drop-shadow-md"
-                          />
-                        </g>
-                      )}
-
-                    </svg>
-
-                    {/* LIVE VESSEL RADAR SYSTEM BAR HUD PANEL */}
-                    <div className="absolute bottom-3 left-3 right-3 bg-slate-950/90 backdrop-blur-md px-4 py-2.5 rounded-xl border border-slate-800 flex flex-wrap items-center justify-between gap-3 font-mono text-xs text-slate-400 select-none">
-                      <div className="flex items-center gap-3">
-                        <span className="flex items-center gap-1.5 text-teal-400 font-bold">
-                          <span className="inline-flex h-2 w-2 rounded-full bg-teal-400 animate-pulse" />
-                          LIVE MONITOR
-                        </span>
-                        <span>MMSI: <span className="text-white font-bold">{currentVesselData.mmsi}</span></span>
-                        <span className="hidden md:inline text-slate-700">|</span>
-                        <span className="hidden md:inline">현재 선박 속도: <span className="text-white font-bold">{svgLines.preproSvg[currentPlayIdx]?.sog || currentVesselData.points[0]?.sog} kts</span></span>
-                        <span className="hidden md:inline text-slate-700">|</span>
-                        <span className="hidden md:inline">현재 운항 방향(각도): <span className="text-white font-bold">{svgLines.preproSvg[currentPlayIdx]?.cog || currentVesselData.points[0]?.cog}°</span></span>
-                        <span className="hidden md:inline text-slate-700">|</span>
-                        <span className="hidden md:inline">감시 표준 시각: <span className="text-white font-bold">{svgLines.preproSvg[currentPlayIdx]?.timestamp || currentVesselData.points[0]?.timestamp}</span></span>
+                  {/* VESSEL SELECTION DROP-ACCORDION */}
+                  <div className="bg-[#090f19] border border-slate-800 p-4 rounded-lg">
+                    <div className="flex flex-col md:flex-row gap-4 items-start md:items-center justify-between">
+                      <div>
+                        <h3 className="text-xs font-bold text-white uppercase tracking-wider font-display mb-1">실시간 교신 추적 선박 선택</h3>
+                        <p className="text-[11px] text-slate-400">데이터셋 내 연속 궤적이 온전히 식별된 다음 선박 중 모의 시뮬레이션을 가동할 대상 지정</p>
                       </div>
 
-                      <div className="flex items-center gap-2 text-slate-500">
-                        {mapCursorLatLng ? (
-                          <span className="text-teal-400/90">
-                            좌표: Lat {mapCursorLatLng.lat.toFixed(4)}°N, Lon {mapCursorLatLng.lon.toFixed(4)}°E
-                          </span>
-                        ) : (
-                          <span>커서를 지도에 올릴 시 위경도 표시</span>
+                      <div className="flex items-center gap-2 w-full md:w-auto">
+                        <select 
+                          value={selectedMmsi} 
+                          onChange={(e) => {
+                            setSelectedMmsi(e.target.value);
+                            logToConsole(`선택 선박을 [MMSI: ${e.target.value}] 대상으로 교환하여 관제 지오펜스를 정비합니다.`);
+                          }}
+                          className="text-xs bg-slate-900 text-slate-200 border border-slate-800 rounded px-3 py-2 focus:border-teal-500 font-mono focus:outline-none min-w-[200px]"
+                        >
+                          {Array.from(new Set(parsedRows.map((_, rIdx) => {
+                            const isMmapped = headers.indexOf(columnMapping.mmsi || '');
+                            return isMmapped !== -1 ? parsedRows[rIdx][isMmapped] : null;
+                          }).filter(Boolean))).map(m => (
+                            <option key={m} value={m}>MMSI: {m}</option>
+                          ))}
+                        </select>
+                      </div>
+                    </div>
+                  </div>
+
+                  {/* RADAR MAP STAGE GRID & SIM PLAYBACK */}
+                  <div className="grid grid-cols-1 xl:grid-cols-3 gap-6">
+                    
+                    {/* RADAR MAP VIEWPORT */}
+                    <div className="xl:col-span-2 bg-[#090f19] border border-slate-800 rounded-lg overflow-hidden flex flex-col h-[520px]">
+                      
+                      {/* VIEWPORT CONTROLLER BAR */}
+                      <div className="bg-slate-900 px-4 py-2.5 flex justify-between items-center border-b border-slate-800 text-xs text-slate-400">
+                        <span className="font-semibold text-slate-300 flex items-center gap-1.5">
+                          <Eye className="w-4 h-4 text-teal-400" />
+                          해양 지오펜스 관제 실황 지도
+                        </span>
+
+                        <div className="flex items-center gap-4">
+                          <label className="flex items-center gap-1 cursor-pointer select-none text-[11px]">
+                            <input 
+                              type="checkbox" 
+                              checked={showRestrictedZone} 
+                              onChange={() => setShowRestrictedZone(!showRestrictedZone)}
+                              className="rounded border-slate-700 bg-slate-900 text-teal-500 w-3.5 h-3.5"
+                            />
+                            산호초 보호구역 표시
+                          </label>
+                          <label className="flex items-center gap-1 cursor-pointer select-none text-[11px]">
+                            <input 
+                              type="checkbox" 
+                              checked={showPredictedPath} 
+                              onChange={() => setShowPredictedPath(!showPredictedPath)}
+                              className="rounded border-slate-700 bg-slate-900 text-teal-500 w-3.5 h-3.5"
+                            />
+                            예측 항로 표시
+                          </label>
+                          <div className="h-4 w-px bg-slate-800" />
+                          <div className="flex items-center gap-1">
+                            <button onClick={() => handleZoom(1.2)} className="w-5 h-5 bg-slate-800 hover:bg-slate-700 text-white font-bold rounded flex items-center justify-center text-xs">+</button>
+                            <button onClick={() => handleZoom(0.8)} className="w-5 h-5 bg-slate-800 hover:bg-slate-700 text-white font-bold rounded flex items-center justify-center text-sm">-</button>
+                            <button onClick={handleResetMap} className="text-[10px] bg-slate-800 hover:bg-slate-700 text-slate-300 px-1.5 py-0.5 rounded ml-1">리셋</button>
+                          </div>
+                        </div>
+                      </div>
+
+                      {/* CANVAS FIELD */}
+                      <div 
+                        ref={mapRef}
+                        className="grow relative overflow-hidden bg-[#03060a] cursor-grab active:cursor-grabbing select-none"
+                        onMouseDown={handleMapMouseDown}
+                        onMouseMove={handleMapMouseMove}
+                        onMouseUp={handleMapMouseUp}
+                        onMouseLeave={handleMapMouseUp}
+                      >
+                        {/* ABSOLUTE RADAR NOISE BG EFFECTS */}
+                        <div className="absolute inset-0 bg-radial-grid opacity-15" />
+                        
+                        {/* MINI LEGEND */}
+                        <div className="absolute bottom-4 left-4 bg-slate-950/90 border border-slate-800 rounded p-2.5 space-y-1.5 z-10 text-[10px]">
+                          <div className="flex items-center gap-2">
+                            <span className="w-3 h-0.5 bg-emerald-400 block" />
+                            <span className="text-slate-300">실시간 실제 수신 경로</span>
+                          </div>
+                          <div className="flex items-center gap-2">
+                            <span className="w-3 h-0.5 bg-dashed-amber block" style={{ borderBottom: '1px dashed #f59e0b' }} />
+                            <span className="text-slate-300">물리 관성 안전 예측 경로</span>
+                          </div>
+                          <div className="flex items-center gap-2">
+                            <span className="w-3 h-3 rounded-full bg-rose-500/10 border border-rose-500/40 block" />
+                            <span className="text-slate-300">산호초 생태 환경 보호 구역</span>
+                          </div>
+                        </div>
+
+                        {/* MAP DRAW STAGE BY SVG */}
+                        {simulationPoints.length > 0 ? (() => {
+                          // 자동 스케일링 경위도 맵핑 바운스 생성
+                          const lats = simulationPoints.map(p => p.lat);
+                          const lons = simulationPoints.map(p => p.lon);
+                          
+                          // 외연 버퍼 계산
+                          const latMin = Math.min(...lats, reefCenter.lat) - 0.04;
+                          const latMax = Math.max(...lats, reefCenter.lat) + 0.04;
+                          const lonMin = Math.min(...lons, reefCenter.lon) - 0.04;
+                          const lonMax = Math.max(...lons, reefCenter.lon) + 0.04;
+
+                          const latRange = latMax - latMin;
+                          const lonRange = lonMax - lonMin;
+
+                          // 500x400 표준 내부 플롯 뷰로 맵 좌표 치환
+                          const mapX = (lon: number) => {
+                            return 50 + ((lon - lonMin) / lonRange) * 500;
+                          };
+                          const mapY = (lat: number) => {
+                            // 위도는 위가 서쪽 위로 가므로 y는 대향 반전 처리
+                            return 350 - ((lat - latMin) / latRange) * 300;
+                          };
+
+                          return (
+                            <svg 
+                              className="w-full h-full"
+                              viewBox="0 0 600 400"
+                              style={{
+                                transform: `scale(${viewport.scale}) translate(${viewport.x}px, ${viewport.y}px)`,
+                                transformOrigin: 'center center',
+                                transition: 'transform 0.1s ease-out'
+                              }}
+                            >
+                              {/* 1. GEOFENCE ZONE */}
+                              {showRestrictedZone && (
+                                <>
+                                  <circle 
+                                    cx={mapX(reefCenter.lon)} 
+                                    cy={mapY(reefCenter.lat)} 
+                                    r={40} // 원 반지름
+                                    fill="rgba(244, 63, 94, 0.07)"
+                                    stroke="#f43f5e"
+                                    strokeWidth="1"
+                                    strokeDasharray="3,3"
+                                  />
+                                  <text 
+                                    x={mapX(reefCenter.lon) - 45} 
+                                    y={mapY(reefCenter.lat) - 45} 
+                                    fill="#f43f5e" 
+                                    className="text-[9px] font-bold fill-rose-400"
+                                  >
+                                    산호초 보호구역 (Geofence)
+                                  </text>
+                                </>
+                              )}
+
+                              {/* 2. ACTUAL HISTORIC PATH (LINE) */}
+                              <polyline
+                                points={simulationPoints.map(p => `${mapX(p.lon)},${mapY(p.lat)}`).join(' ')}
+                                fill="none"
+                                stroke="#10b981"
+                                strokeWidth="2.5"
+                              />
+
+                              {/* 3. PREDICTED PATH (LINE) */}
+                              {showPredictedPath && predictions.length > 1 && (
+                                <polyline
+                                  points={predictions.filter(p => p.pred_lat && p.pred_lon).map(p => `${mapX(p.pred_lon)},${mapY(p.pred_lat)}`).join(' ')}
+                                  fill="none"
+                                  stroke="#f59e0b"
+                                  strokeWidth="1.5"
+                                  strokeDasharray="4,4"
+                                />
+                              )}
+
+                              {/* 4. ACTUAL HISTORIC DOTS */}
+                              {simulationPoints.map((p, pIdx) => {
+                                const isCurrent = pIdx === currentPlayIdx;
+                                return (
+                                  <circle
+                                    key={`act-${pIdx}`}
+                                    cx={mapX(p.lon)}
+                                    cy={mapY(p.lat)}
+                                    r={isCurrent ? 6 : 4}
+                                    className={isCurrent ? "fill-teal-400 stroke-white stroke-2 animate-pulse" : "fill-emerald-500"}
+                                  />
+                                );
+                              })}
+
+                              {/* 5. CURRENT SIMULATION POINTER AND ACCENT COGNITIVE */}
+                              {activePoint && (
+                                <g>
+                                  {/* 가속 방향 침로 COG 지시선 */}
+                                  <line
+                                    x1={mapX(activePoint.lon)}
+                                    y1={mapY(activePoint.lat)}
+                                    x2={mapX(activePoint.lon) + Math.sin(activePoint.cog * Math.PI / 180) * 20}
+                                    y2={mapY(activePoint.lat) - Math.cos(activePoint.cog * Math.PI / 180) * 20}
+                                    stroke="#10b981"
+                                    strokeWidth="2"
+                                    markerEnd="url(#arrow)"
+                                  />
+                                </g>
+                              )}
+
+                              {/* 6. WARNING SIGN ON VIOLATION */}
+                              {activePoint && isInsideReefForbidden && (
+                                <g transform={`translate(${mapX(activePoint.lon) - 10}, ${mapY(activePoint.lat) - 25})`}>
+                                  <rect x="0" y="0" width="85" height="14" rx="2" fill="#be123c" className="animate-bounce" />
+                                  <text x="5" y="10" fill="#ffffff" className="text-[7.5px] font-bold">⚠️ 보호지 한계 침입!</text>
+                                </g>
+                              )}
+
+                              {/* I탈 경고 지시창 */}
+                              {activePred && activePred.error_distance_m > 480 && (
+                                <g transform={`translate(${mapX(activePred.actual_lon) + 8}, ${mapY(activePred.actual_lat) - 8})`}>
+                                  <rect x="0" y="0" width="130" height="15" rx="2" fill="#ea580c" />
+                                  <text x="4" y="11" fill="#ffffff" className="text-[7.5px] font-bold font-sans">
+                                    ⚠️ 정상 범위를 {activePred.error_distance_m}m 이탈!
+                                  </text>
+                                </g>
+                              )}
+
+                            </svg>
+                          );
+                        })() : (
+                          <div className="absolute inset-0 flex items-center justify-center text-slate-500 text-xs">
+                            분석한 선박 AIS 점이 존재하지 않습니다.
+                          </div>
                         )}
                       </div>
-                    </div>
 
-                    {/* TARGET POINT FLUID DETAIL SPEC CARD */}
-                    {hoveredPoint && (
-                      <div 
-                        className="absolute bg-slate-900/95 backdrop-blur-md border border-slate-700 rounded-xl p-3.5 shadow-2xl z-30 font-mono text-[11px] leading-relaxed select-none text-slate-200 pointer-events-none w-64 uppercase"
-                        style={{
-                          left: `${Math.min(70, hoveredPoint.x)}%`,
-                          top: `${Math.min(70, hoveredPoint.y)}%`
-                        }}
-                      >
-                        <div className="flex items-center justify-between gap-2 border-b border-slate-800 pb-1.5 mb-1.5 ">
-                          <span className="font-bold text-white text-xs flex items-center gap-1">
-                            <Ship className="w-3.5 h-3.5 text-teal-400" />
-                            TELEMETRY [PT-{hoveredPoint.index + 1}]
-                          </span>
-                          <span className={`px-1 py-0.5 rounded text-[8px] font-bold ${hoveredPoint.isValid ? 'bg-teal-500/10 text-teal-400' : 'bg-red-500/10 text-red-400'}`}>
-                            {hoveredPoint.isValid ? 'NORMAL' : 'OUTLIER'}
-                          </span>
-                        </div>
-                        <div className="space-y-1">
-                          <div className="flex justify-between">
-                            <span className="text-slate-500">MMSI:</span>
-                            <span className="text-slate-200 font-bold">{hoveredPoint.mmsi}</span>
-                          </div>
-                          <div className="flex justify-between">
-                            <span className="text-slate-500">TIMESTAMP:</span>
-                            <span className="text-slate-200">{hoveredPoint.timestamp}</span>
-                          </div>
-                          <div className="flex justify-between">
-                            <span className="text-slate-500">LAT / LON:</span>
-                            <span className="text-slate-100 font-semibold">{hoveredPoint.lat.toFixed(4)}, {hoveredPoint.lon.toFixed(4)}</span>
-                          </div>
-                          <div className="flex justify-between">
-                            <span className="text-slate-500">SPEED (SOG):</span>
-                            <span className="text-teal-400 font-bold">{hoveredPoint.sog} kts</span>
-                          </div>
-                          <div className="flex justify-between">
-                            <span className="text-slate-500">HEADING (COG):</span>
-                            <span className="text-amber-400">{hoveredPoint.cog}°</span>
-                          </div>
-
-                          {/* Render Lag values if features tab hovered */}
-                          {engineeredData[hoveredPoint.index] && (
-                            <div className="border-t border-slate-800/80 pt-1.5 mt-1.5 space-y-1">
-                              <div className="flex justify-between text-[10px]">
-                                <span className="text-slate-500">LAG_1 LAT/LON:</span>
-                                <span className="text-slate-400">
-                                  {engineeredData[hoveredPoint.index].lat_lag1?.toFixed(3) || "N/A"}, {engineeredData[hoveredPoint.index].lon_lag1?.toFixed(3) || "N/A"}
-                                </span>
-                              </div>
-                              <div className="flex justify-between text-[10px]">
-                                <span className="text-slate-500">COG SHIFT DIFF:</span>
-                                <span className={`${Math.abs(engineeredData[hoveredPoint.index].cog_diff || 0) > anomalyCofThreshold ? 'text-amber-500 font-bold' : 'text-slate-400'}`}>
-                                  {engineeredData[hoveredPoint.index].cog_diff}°
-                                </span>
-                              </div>
-                              <div className="flex justify-between text-[10px]">
-                                <span className="text-slate-500">SOG SLIP ACCEL:</span>
-                                <span className={`${Math.abs(engineeredData[hoveredPoint.index].sog_diff || 0) > 6 ? 'text-rose-500 font-bold' : 'text-slate-400'}`}>
-                                  {engineeredData[hoveredPoint.index].sog_diff} kts
-                                </span>
-                              </div>
-                            </div>
-                          )}
-                        </div>
-                      </div>
-                    )}
-
-                  </div>
-
-                </div>
-
-                {/* 2. RIGHT SIDEBAR WORKSPACE: ANOMALY ALERT EVENT TELEMETRY LOGS */}
-                <div className="flex flex-col select-none bg-slate-950 max-h-[460px] xl:max-h-none">
-                  
-                  {/* ALERTS SECTION HEAD */}
-                  <div className="p-4 border-b border-slate-900 bg-slate-900/10 flex items-center justify-between shrink-0">
-                    <span className="text-xs font-bold font-display uppercase tracking-widest text-slate-300 flex items-center gap-1.5">
-                      <AlertTriangle className="w-4 h-4 text-rose-500 animate-pulse" />
-                      🚨 실시간 해양 오염 위협 감시 알림
-                    </span>
-                    <span className="font-mono text-[10px] px-2 py-0.5 rounded bg-rose-500/10 border border-rose-500/20 text-rose-400">
-                      LIVE STREAM
-                    </span>
-                  </div>
-
-                  {/* ANOMALY LIST SCROLLER */}
-                  <div className="grow overflow-y-auto p-4 space-y-2 max-h-[180px] xl:max-h-none">
-                    {anomaliesList.length === 0 ? (
-                      <div className="h-full flex flex-col items-center justify-center p-8 text-center text-slate-500">
-                        <CheckCircle className="w-10 h-10 text-teal-500/30 mb-2" />
-                        <p className="text-xs font-semibold">탐출된 이상 운항 징후 없음</p>
-                        <p className="text-[10px] text-slate-600 mt-1">
-                          해당 선박 시나리오 내 모든 침로가 규정 속력과 각도 범위를 준수하고 있으며, 안전 항해 상태를 유지하고 있습니다.
-                        </p>
-                      </div>
-                    ) : (
-                      anomaliesList.map((a, idx) => {
-                        let icon = <AlertTriangle className="w-4 h-4" />;
-                        let colors = "border-amber-500/30 bg-amber-500/5 text-amber-200";
-                        if (a.severity === 'high') {
-                          colors = "border-red-500/30 bg-red-500/5 text-red-200";
-                          icon = <Skull className="w-4 h-4" />;
-                        } else if (a.type === 'NOISE_FILTERED') {
-                          colors = "border-slate-800 bg-slate-900/30 text-slate-400";
-                          icon = <Trash2 className="w-4 h-4 opacity-50" />;
-                        }
-
-                        return (
-                          <div
-                            key={`alert-${idx}`}
-                            className={`p-2.5 rounded-lg border flex flex-col gap-1 text-[11px] ${colors}`}
+                      {/* REPLAY INSTRUMENT CONSOLE BAR */}
+                      <div className="bg-slate-900 border-t border-slate-800 p-4 flex flex-col md:flex-row justify-between items-start md:items-center gap-4 z-10 shrink-0">
+                        <div className="flex items-center gap-3">
+                          <button 
+                            onClick={() => setIsPlaying(!isPlaying)}
+                            className="w-10 h-10 rounded-full bg-teal-500 hover:bg-teal-400 text-slate-900 flex items-center justify-center transition-transform hover:scale-105 active:scale-95"
                           >
-                            <div className="flex items-center justify-between border-b border-white/5 pb-1 font-mono">
-                              <span className="font-bold flex items-center gap-1 text-xs">
-                                {icon}
-                                {a.type}
-                              </span>
-                              <span className="text-slate-500">
-                                {a.timestamp.substring(11)}
+                            {isPlaying ? <Pause className="w-5 h-5 fill-slate-900" /> : <Play className="w-5 h-5 fill-slate-900 ml-0.5" />}
+                          </button>
+                          
+                          <button 
+                            onClick={() => {
+                              setCurrentPlayIdx(0);
+                              setIsPlaying(false);
+                              logToConsole("🔄 시뮬레이션 경로 타임슬라이더를 시작지점으로 되감았습니다.");
+                            }}
+                            className="p-2 bg-slate-800 hover:bg-slate-700 text-slate-300 rounded"
+                            title="되감기"
+                          >
+                            <RotateCcw className="w-4 h-4" />
+                          </button>
+
+                          <div className="h-6 w-px bg-slate-850" />
+
+                          <div>
+                            <span className="text-[10px] text-slate-500 uppercase tracking-widest font-bold block leading-none">실시간 항해 시뮬레이션 재생</span>
+                            <span className="text-xs font-mono font-bold text-white mt-1.5 block">
+                              {(currentPlayIdx + 1).toString().padStart(2, '0')} / {simulationPoints.length.toString().padStart(2, '0')} 노드 정렬 진행 중
+                            </span>
+                          </div>
+                        </div>
+
+                        {/* PLAY SPEED SLIDER */}
+                        <div className="flex items-center gap-3 w-full md:w-auto">
+                          <span className="text-[10px] text-slate-400 font-bold shrink-0">배속 변경</span>
+                          <input 
+                            type="range"
+                            min="300"
+                            max="2500"
+                            step="200"
+                            value={playSpeed}
+                            onChange={(e) => setPlaySpeed(Number(e.target.value))}
+                            className="bg-slate-800 h-1 rounded w-32 cursor-pointer accent-teal-400"
+                          />
+                          <span className="text-xs font-mono text-teal-400 font-semibold shrink-0">{(3000 - playSpeed)/1000}x</span>
+                        </div>
+                      </div>
+
+                    </div>
+
+                    {/* DYNAMIC ALERT BOX & CONTROLLER FOR MODE A */}
+                    <div className="bg-[#090f19] border border-slate-800 p-5 rounded-lg flex flex-col justify-between h-[520px]">
+                      
+                      <div className="space-y-4 overflow-y-auto shrink-0 grow select-none h-[420px] custom-scrollbar">
+                        <span className="text-[10px] text-slate-500 font-bold uppercase tracking-widest block border-b border-slate-800/80 pb-2">동적 선박 현황 텔레메트리</span>
+                        
+                        {activePoint ? (
+                          <div className="space-y-4">
+                            
+                            {/* SHIP META NAME BLOCK */}
+                            <div>
+                              <span className="text-[10px] text-slate-500 block">선박 식별 번호 (MMSI)</span>
+                              <span className="text-sm font-bold font-mono text-white flex items-center gap-1.5 mt-0.5">
+                                <Database className="w-4 h-4 text-slate-400" />
+                                {activePoint.mmsi}
                               </span>
                             </div>
-                            <p className="text-slate-300 leading-relaxed font-sans">{a.message}</p>
-                            <button
-                              onClick={() => {
-                                // Pinpoint target coords from alert
-                                const { cleaned } = cleaningResult;
-                                const matchIdx = cleaned.findIndex(p => p.timestamp === a.timestamp);
-                                if (matchIdx !== -1) {
-                                  setCurrentPlayIdx(matchIdx);
-                                  setSystemLogs(l => [...l, `[관제] 위협 지정 관찰 이동 - Index ${matchIdx + 1}`]);
-                                }
-                              }}
-                              className="self-end text-[10px] font-bold text-teal-400/90 hover:text-teal-300 flex items-center gap-0.5 mt-1"
-                            >
-                              레이더 추적 지정 <ChevronRight className="w-3 h-3" />
-                            </button>
+
+                            {/* VESSEL NAME */}
+                            <div>
+                              <span className="text-[10px] text-slate-500 block">감시 선박명</span>
+                              <span className="text-sm font-bold text-teal-400 mt-0.5 block">
+                                {activePoint.vesselName || activePoint.originalRow["선박명"] || "미확인 국적선 (한글명 없음)"}
+                              </span>
+                            </div>
+
+                            {/* COGNITIVE COORDINATE STAT */}
+                            <div className="grid grid-cols-2 gap-3">
+                              <div className="bg-slate-900/50 p-2 rounded border border-slate-800">
+                                <span className="text-[9px] text-slate-500 block">현재 수신 위도</span>
+                                <span className="text-xs font-bold font-mono text-slate-300 mt-1 block">{activePoint.lat.toFixed(5)}° N</span>
+                              </div>
+                              <div className="bg-slate-900/50 p-2 rounded border border-slate-800">
+                                <span className="text-[9px] text-slate-500 block">현재 수신 경도</span>
+                                <span className="text-xs font-bold font-mono text-slate-300 mt-1 block">{activePoint.lon.toFixed(5)}° E</span>
+                              </div>
+                            </div>
+
+                            {/* SOG COG SPEED HEADINGS */}
+                            <div className="grid grid-cols-3 gap-2">
+                              <div className="bg-slate-900/50 p-2 rounded border border-slate-800 text-center">
+                                <span className="text-[9px] text-slate-500 block">수신 속도</span>
+                                <span className="text-xs font-bold font-mono text-teal-400 mt-1 block">{activePoint.sog} kts</span>
+                              </div>
+                              <div className="bg-slate-900/50 p-2 rounded border border-slate-800 text-center">
+                                <span className="text-[9px] text-slate-500 block">수신 방향</span>
+                                <span className="text-xs font-bold font-mono text-amber-400 mt-1 block">{activePoint.cog}°</span>
+                              </div>
+                              <div className="bg-slate-900/50 p-2 rounded border border-slate-800 text-center hover:bg-slate-800 transition-colors">
+                                <span className="text-[9px] text-slate-500 block">안전 이격 오차</span>
+                                <span className={`text-xs font-bold font-mono mt-1 block ${isDeviationAlert ? 'text-rose-400' : 'text-slate-300'}`}>
+                                  {activePred ? activePred.error_distance_m : 0} m
+                                </span>
+                              </div>
+                            </div>
+
+                            {/* TIMELINE SLOTS STACK */}
+                            <div>
+                              <span className="text-[10px] text-slate-500 block">AIS 최종 무선 수신표준시각</span>
+                              <span className="text-xs font-mono text-slate-300 mt-0.5 block flex items-center gap-1">
+                                <Clock className="w-3.5 h-3.5 text-slate-500" />
+                                {activePoint.timestamp}
+                              </span>
+                            </div>
+
+                            {/* INTUITIVE ALERTS PANEL */}
+                            {isInsideReefForbidden || isDeviationAlert ? (
+                              <div className="p-3 bg-red-950/20 border border-red-500/30 rounded-md space-y-2">
+                                <span className="text-xs font-bold text-rose-400 flex items-center gap-1">
+                                  <AlertTriangle className="w-4 h-4 text-rose-500 animate-pulse animate-duration-500" />
+                                  해양 보호 구역 비상 위협 탐보
+                                </span>
+                                <div className="space-y-1 text-[11px] text-slate-300 leading-snug">
+                                  {isInsideReefForbidden && (
+                                    <p className="flex items-center gap-1.5">
+                                      <span className="w-1.5 h-1.5 rounded-full bg-rose-500 animate-ping inline-block" />
+                                      산호초 특별 환경 보존지구 내부선 {currentDistanceToReef}m 영역 유단 과속 침투 중!
+                                    </p>
+                                  )}
+                                  {isDeviationAlert && (
+                                    <p className="flex items-center gap-1.5">
+                                      <span className="w-1.5 h-1.5 rounded-full bg-amber-500 animate-ping inline-block" />
+                                      인공지능 예측 항로 오차 유의 이탈 수치({activePred.error_distance_m}m) 초과. 급선선회/오염물 투기 위용 감지!
+                                    </p>
+                                  )}
+                                </div>
+                              </div>
+                            ) : (
+                              <div className="p-3 bg-emerald-950/10 border border-emerald-500/20 rounded-md text-[11px] text-emerald-400 flex items-center gap-1.5 leading-snug">
+                                <Shield className="w-4 h-4 text-emerald-400" />
+                                통제 센터 안전 진단: 해당 지점에서는 정상 범위 등속 운항을 보존 중입니다 (특이사항 없음).
+                              </div>
+                            )}
+
                           </div>
-                        );
-                      })
-                    )}
+                        ) : (
+                          <p className="text-xs text-slate-500 italic">시뮬레이션 재생 목록이 활성화되면 세부 정보가 실시간 표출됩니다.</p>
+                        )}
+                      </div>
+
+                      {/* PARAMETERS ADJUST RAIL */}
+                      <div className="border-t border-slate-800/80 pt-3 space-y-3 shrink-0">
+                        <span className="text-[10px] text-slate-500 font-bold uppercase tracking-widest block flex items-center gap-1">
+                          <Sliders className="w-3 h-3 text-teal-400" />
+                          환경 감시 안전 알고리즘 실시간 감도 설정
+                        </span>
+                        
+                        <div className="space-y-2.5">
+                          <div>
+                            <div className="flex justify-between items-center text-[10px] text-slate-400 mb-1">
+                              <span>오염 의심 급선회 임계각</span>
+                              <span className="text-teal-400 font-bold font-mono">±{anomalyCofThreshold}°</span>
+                            </div>
+                            <input 
+                              type="range"
+                              min="15"
+                              max="90"
+                              step="5"
+                              value={anomalyCofThreshold}
+                              onChange={(e) => {
+                                setAnomalyCofThreshold(Number(e.target.value));
+                                logToConsole(`⚙️ [파라미터 변경] 오염 의심방향 COG 변동 감도를 ${e.target.value}° 로 재조정했습니다.`);
+                              }}
+                              className="w-full bg-slate-900 h-1.5 rounded appearance-none cursor-pointer accent-teal-400"
+                            />
+                          </div>
+
+                          <div>
+                            <div className="flex justify-between items-center text-[10px] text-slate-400 mb-1">
+                              <span>동등 물리 2차 예측과 한계 오차치</span>
+                              <span className="text-amber-400 font-bold font-mono">480 m</span>
+                            </div>
+                            <div className="text-[9px] text-slate-500 leading-normal">
+                              2차 보간 궤적이 실제 도취값과 480미터 이상 유전 격각 오차가 날 경우 경보를 자동 활성화합니다.
+                            </div>
+                          </div>
+                        </div>
+                      </div>
+
+                    </div>
+
                   </div>
 
-                  {/* SYSTEM AUDIO & AUDIT CONSOLE LOG */}
-                  <div className="border-t border-slate-900 bg-black/40 p-3 h-48 select-none flex flex-col">
-                    <span className="text-[10px] font-bold text-slate-500 font-mono tracking-widest uppercase mb-1.5 flex items-center gap-1">
-                      <FileText className="w-3 h-3 text-indigo-400" />
-                      시스템 실시간 추적 기록
-                    </span>
-                    <div className="grow overflow-y-auto font-mono text-[10px] text-teal-500/80 tracking-tight space-y-1 custom-scrollbar leading-relaxed">
-                      {systemLogs.map((log, lidx) => (
-                        <div key={`log-${lidx}`} className="truncate">
-                          <span className="text-slate-600 mr-1.5">{new Date().toLocaleTimeString()}</span>
-                          {log}
+                </div>
+              ) : (
+                // ==========================================
+                // [MODE B] UNPREDICTABLE DATA PROFILE MONITOR
+                // ==========================================
+                <div className="p-6 space-y-6">
+                  
+                  {/* WARNING OUTLINE OF FAILING COORDINATE */}
+                  <div className="bg-amber-950/20 border border-amber-500/30 p-5 rounded-lg flex flex-col md:flex-row gap-4 items-start md:items-center justify-between">
+                    <div className="space-y-1.5 min-w-0">
+                      <h2 className="text-sm font-bold text-amber-400 flex items-center gap-2">
+                        <AlertTriangle className="w-4 h-4 shrink-0 animate-bounce" />
+                        ⚠️ 인공지능 항로 이동 예측 불가능 (위도/경도 결손 확정)
+                      </h2>
+                      <p className="text-xs text-slate-300 leading-relaxed max-w-2xl">
+                        한국 공공데이터 형식의 특성상 위도(Latitude) 및 경도(Longitude) 칼럼이 유실되어 있거나, 좌표 수신 미완료 데이터이기 때문에
+                        지리적 항로 2차 융합 보간이나 AI 경로 시뮬레이션을 가동할 수 없습니다. 대신 다음의 AIS 이상값 탐지 및 제원 품질 감시를 가동합니다.
+                      </p>
+                    </div>
+
+                    <button 
+                      onClick={loadDemoA}
+                      className="px-4 py-2 bg-slate-800 hover:bg-slate-700 text-teal-400 border border-slate-700 hover:border-teal-400 rounded text-xs font-semibold shrink-0 transition-all flex items-center gap-1"
+                    >
+                      지도 구동형 데모 A 로드하기
+                    </button>
+                  </div>
+
+                  {/* HIGH RESOLUTIVE DIAGNOSTIC BLOCKS */}
+                  <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
+                    
+                    {/* LOST ESSENTIAL CHANNELS */}
+                    <div className="bg-[#090f19] border border-slate-800 p-5 rounded-lg space-y-3 flex flex-col justify-between">
+                      <div className="space-y-3">
+                        <span className="text-[10px] text-slate-500 font-bold uppercase tracking-widest block">항로 예측 보장 필수 컬럼</span>
+                        <div className="space-y-2.5">
+                          <div className="flex items-center justify-between border-b border-slate-850 pb-1.5">
+                            <span className="text-xs text-slate-300 flex items-center gap-1.5">
+                              <span className={`w-2 h-2 rounded-full ${columnMapping.mmsi ? 'bg-teal-400' : 'bg-rose-500'}`} />
+                              식별 고유키 (MMSI / 선박번호)
+                            </span>
+                            <span className="text-[10px] font-mono text-slate-500 uppercase">{columnMapping.mmsi ? '감지' : '미감지'}</span>
+                          </div>
+                          <div className="flex items-center justify-between border-b border-slate-850 pb-1.5">
+                            <span className="text-xs text-slate-300 flex items-center gap-1.5">
+                              <span className={`w-2 h-2 rounded-full ${columnMapping.timestamp ? 'bg-teal-400' : 'bg-rose-500'}`} />
+                              표준 수신시각 (Timestamp / 수신시각)
+                            </span>
+                            <span className="text-[10px] font-mono text-slate-500 uppercase">{columnMapping.timestamp ? '감지' : '미감지'}</span>
+                          </div>
+                          <div className="flex items-center justify-between border-b border-slate-850 pb-1.5">
+                            <span className="text-xs text-slate-300 flex items-center gap-1.5">
+                              <span className={`w-2 h-2 rounded-full ${columnMapping.lat ? 'bg-teal-400' : 'bg-rose-500'}`} />
+                              위도 좌표 (Latitude / 위도)
+                            </span>
+                            <span className="text-[10px] font-mono text-slate-500 uppercase">{columnMapping.lat ? '감지' : '미감지'}</span>
+                          </div>
+                          <div className="flex items-center justify-between border-b border-slate-850 pb-1.5">
+                            <span className="text-xs text-slate-300 flex items-center gap-1.5">
+                              <span className={`w-2 h-2 rounded-full ${columnMapping.lon ? 'bg-teal-400' : 'bg-rose-500'}`} />
+                              경도 좌표 (Longitude / 경도)
+                            </span>
+                            <span className="text-[10px] font-mono text-slate-500 uppercase">{columnMapping.lon ? '감지' : '미감지'}</span>
+                          </div>
                         </div>
-                      ))}
+                      </div>
+
+                      <div className="p-3 bg-rose-950/20 border border-rose-500/20 rounded mt-3 text-[11px] leading-relaxed text-rose-300">
+                        📌 지리 예측 관제를 실행하기 위해서는 가상 또는 수집용 위경도 및 시간 행이 연속성을 확보하여 추가 탑재되어야 합니다.
+                      </div>
+                    </div>
+
+                    {/* QUALITY DIAGNOSTIC SUMMARY PANEL */}
+                    <div className="bg-[#090f19] border border-slate-800 p-5 rounded-lg space-y-4">
+                      <span className="text-[10px] text-slate-500 font-bold uppercase tracking-widest block">제원 누락 및 수신 불량 지표</span>
+                      
+                      <div className="space-y-3 text-xs">
+                        <div className="flex justify-between items-center bg-slate-900/50 p-2.5 rounded border border-slate-850">
+                          <span className="text-slate-400">총 고유 선박 수</span>
+                          <span className="font-mono font-bold text-white">{diagnostic.totalVessels} 척</span>
+                        </div>
+                        <div className="flex justify-between items-center bg-slate-900/50 p-2.5 rounded border border-slate-850">
+                          <span className="text-slate-400">선박명 누락</span>
+                          <span className={`font-mono font-bold ${diagnostic.missingVesselNameCount > 0 ? 'text-amber-400' : 'text-slate-300'}`}>{diagnostic.missingVesselNameCount} 건</span>
+                        </div>
+                        <div className="flex justify-between items-center bg-slate-900/50 p-2.5 rounded border border-slate-850">
+                          <span className="text-slate-400">호출부호 결손</span>
+                          <span className={`font-mono font-bold ${diagnostic.missingCallSignCount > 0 ? 'text-amber-400' : 'text-slate-300'}`}>{diagnostic.missingCallSignCount} 건</span>
+                        </div>
+                        <div className="flex justify-between items-center bg-slate-900/50 p-2.5 rounded border border-slate-850">
+                          <span className="text-slate-400">IMO 선박고유코드 오류(0)</span>
+                          <span className="font-mono font-bold text-slate-300">다수의 행 검출됨</span>
+                        </div>
+                      </div>
+                    </div>
+
+                    {/* AIS EXTREMAL FIELD REPORT */}
+                    <div className="bg-[#090f19] border border-slate-800 p-5 rounded-lg space-y-4">
+                      <span className="text-[10px] text-slate-500 font-bold uppercase tracking-widest block">AIS 무수신/기형 이상량 감시</span>
+                      
+                      <div className="space-y-3 text-xs">
+                        <div className="flex justify-between items-center">
+                          <span className="text-slate-400">기형 속도 이상 검검 (SOG: 1023 / 음수 등)</span>
+                          <span className="font-mono font-bold text-rose-400 bg-rose-950/20 border border-rose-500/20 px-2 py-0.5 rounded">
+                            {diagnostic.sogAnomalyCount} 건 감지
+                          </span>
+                        </div>
+                        <div className="flex justify-between items-center">
+                          <span className="text-slate-400">선수방위 초과 이상 (COG: 3600 / 극대 등)</span>
+                          <span className="font-mono font-bold text-amber-400 bg-amber-950/20 border border-amber-500/20 px-2 py-0.5 rounded">
+                            {diagnostic.cogAnomalyCount} 건 감지
+                          </span>
+                        </div>
+                        <div className="flex justify-between items-center">
+                          <span className="text-slate-400">전방 헤딩 각도 분실 (Heading: 511 등)</span>
+                          <span className="font-mono font-bold text-yellow-400 bg-yellow-950/20 border border-yellow-500/20 px-2 py-0.5 rounded">
+                            {diagnostic.headingAnomalyCount} 건 감지
+                          </span>
+                        </div>
+                        <div className="flex justify-between items-center">
+                          <span className="text-slate-400">선박 길이(상하좌우) 비대칭 오류</span>
+                          <span className="font-mono font-bold text-teal-400 bg-teal-500/10 border border-teal-500/20 px-2 py-0.5 rounded">
+                            {diagnostic.sizeAnomalyCount} 건 식별됨
+                          </span>
+                        </div>
+                      </div>
+                    </div>
+
+                  </div>
+
+                  {/* ERROR LOG DETAIL GRID TABLE */}
+                  <div className="bg-[#090f19] border border-slate-800 rounded-lg overflow-hidden">
+                    <div className="p-4 bg-slate-900 border-b border-slate-800 flex justify-between items-center">
+                      <span className="text-xs font-bold text-white uppercase font-display flex items-center gap-1.5">
+                        <Sliders className="w-4 h-4 text-amber-500" />
+                        감시 탐지된 품질 에러 / 이상값 정밀 판독 테이블 (최대 20개 행)
+                      </span>
+                      <span className="text-[10px] text-slate-500 font-mono">COUNT: {diagnostic.issues.length} Issues</span>
+                    </div>
+
+                    <div className="overflow-x-auto">
+                      <table className="w-full text-left text-xs border-collapse">
+                        <thead>
+                          <tr className="bg-slate-900/60 border-b border-slate-850 text-slate-400 text-[10px] uppercase font-bold font-mono tracking-wider">
+                            <th className="p-3.5 pl-5">대상행</th>
+                            <th className="p-3.5">선박식별 mmsi/번호</th>
+                            <th className="p-3.5">수신 시간대</th>
+                            <th className="p-3.5">문제가 된 컬럼</th>
+                            <th className="p-3.5">입력된 실제 값</th>
+                            <th className="p-3.5">이상 유형 분류</th>
+                            <th className="p-3.5 pr-5">상세 진단 해설 및 처방</th>
+                          </tr>
+                        </thead>
+                        <tbody className="divide-y divide-slate-850/60 text-[11px] text-slate-300">
+                          {diagnostic.issues.length === 0 ? (
+                            <tr>
+                              <td colSpan={7} className="p-10 text-center text-slate-500 italic">
+                                🎉 검수 조건상 어떤 식별 이상이나 품질 이격도 발견되지 않았습니다. 완벽히 보관된 양질의 데이터셋입니다.
+                              </td>
+                            </tr>
+                          ) : (
+                            diagnostic.issues.slice(0, 20).map((issue, idx) => (
+                              <tr key={idx} className="hover:bg-slate-900/40 transition-colors">
+                                <td className="p-3 pl-5 font-mono text-slate-400">{issue.rowIdx}</td>
+                                <td className="p-3 font-mono font-bold text-white">{issue.mmsi}</td>
+                                <td className="p-3 font-mono text-slate-500">{issue.timestamp}</td>
+                                <td className="p-3 text-amber-400 font-semibold">{issue.column}</td>
+                                <td className="p-3 font-mono text-rose-400 font-bold bg-rose-500/5 rounded px-2.5 py-0.5 inline-block my-1.5">{issue.value || 'NULL'}</td>
+                                <td className="p-3 font-mono">
+                                  <span className={`px-1.5 py-0.5 rounded text-[9px] font-bold ${
+                                    issue.severity === 'high' ? 'bg-rose-500/10 text-rose-400 border border-rose-500/20' :
+                                    issue.severity === 'medium' ? 'bg-amber-500/10 text-amber-400 border border-amber-500/20' :
+                                    'bg-indigo-500/10 text-indigo-400 border border-indigo-500/20'
+                                  }`}>
+                                    {issue.issueType}
+                                  </span>
+                                </td>
+                                <td className="p-3 pr-5 text-slate-400 max-w-sm shrink-0 leading-relaxed">{issue.message}</td>
+                              </tr>
+                            ))
+                          )}
+                        </tbody>
+                      </table>
                     </div>
                   </div>
 
                 </div>
-              </div>
-            )}
-
-            {/* TAB 2: FEATURES LAG INTERACTIVE TABLE PROOFING */}
-            {activeTab === 'features' && (
-              <div className="p-6 flex flex-col min-h-0 grow overflow-y-auto select-none">
-                
-                {/* LABELS DESCRIPTION HEAD */}
-                <div className="flex items-start justify-between gap-4 mb-4 border-b border-slate-900 pb-4">
-                  <div>
-                    <h3 className="text-base font-bold text-white flex items-center gap-2">
-                      <Sparkles className="w-5 h-5 text-teal-400" />
-                      파생 시계열 윈도우 피처 설계판 (Feature Engineering Suite)
-                    </h3>
-                    <p className="text-xs text-slate-400 mt-1">
-                      MMSI 시계열 그룹 단위로 정렬된 데이터프레임 내부에서 직전 시점(t-1) 및 전전 시점(t-2) 물리적 위치 정보를 결합하여 
-                      XGBoost 학습 피처를 자동 조립한 결과 테이블입니다.
+              )}
+            </>
+          ) : (
+            // ==========================================
+            // [TAB 2] PYTHON EXPORT CODE EDITOR
+            // ==========================================
+            <div className="p-6 space-y-6">
+              
+              <div className="bg-[#090f19] border border-slate-800 p-5 rounded-lg space-y-3">
+                <div className="flex items-center justify-between">
+                  <div className="space-y-1">
+                    <h2 className="text-sm font-bold text-white flex items-center gap-2">
+                      <Code className="w-4 h-4 text-teal-400" />
+                      7단계 로컬 가동용 파이썬(Python) 파일 생성/내보내기
+                    </h2>
+                    <p className="text-xs text-slate-400">
+                      학교 PC 실습실이나 주피터 노트북에서 동일한 임계값 설정을 연동하여 바로 실행할 수 있는 백엔드 분석 파이썬 템플릿입니다.
                     </p>
                   </div>
 
-                  <button
-                    onClick={() => copyToClipboard(JSON.stringify(engineeredData, null, 2), 'engineered-json')}
-                    className="px-3 py-1.5 rounded-lg bg-slate-900 hover:bg-slate-800 border border-slate-800 text-xs text-slate-300 font-mono flex items-center gap-1.5 transition-all"
+                  <button 
+                    onClick={() => copyPythonCode(generatePythonCode({
+                      maxSpeedKts,
+                      anomalyCofThreshold,
+                      isPredictable: diagnostic?.isPredictable || false,
+                      mapping: columnMapping
+                    }))}
+                    className="px-4 py-2 bg-teal-500 hover:bg-teal-400 text-slate-900 rounded font-bold text-xs transition-transform hover:scale-[1.02] flex items-center gap-1.5 shrink-0"
                   >
-                    <Copy className="w-3.5 h-3.5 text-slate-400" />
-                    {copiedCodeIndex === 'engineered-json' ? '복사됨!' : 'EXPORT JSON'}
+                    {copiedCode ? <Check className="w-3.5 h-3.5" /> : <Copy className="w-3.5 h-3.5" />}
+                    {copiedCode ? '복찰 완료!' : '파이썬 코드 복사'}
                   </button>
                 </div>
 
-                {/* COMPUTED DATA TABLE GRIDS */}
-                <div className="grow overflow-auto border border-slate-900 rounded-xl bg-slate-950/40 custom-scrollbar">
-                  <table className="w-full text-left border-collapse text-xs font-mono">
-                    <thead className="sticky top-0 bg-slate-900 text-slate-300 uppercase tracking-widest border-b border-slate-800 text-[10px] select-none">
-                      <tr>
-                        <th className="p-3">Index</th>
-                        <th className="p-3">MMSI</th>
-                        <th className="p-3 text-slate-400">Timestamp</th>
-                        <th className="p-3 text-teal-400">Lat (t)</th>
-                        <th className="p-3 text-teal-400">Lon (t)</th>
-                        <th className="p-3 text-orange-400">SOG (t)</th>
-                        <th className="p-3 text-orange-400">COG (t)</th>
-                        <th className="p-3 text-slate-500">Lat (t-1)</th>
-                        <th className="p-3 text-slate-500">Lon (t-1)</th>
-                        <th className="p-3 text-rose-400">SOG Diff (5m)</th>
-                        <th className="p-3 text-rose-400">COG Diff (5m)</th>
-                        <th className="p-3 text-emerald-400">Travel Dist</th>
-                      </tr>
-                    </thead>
-                    <tbody className="divide-y divide-slate-900 text-slate-300">
-                      {engineeredData.map((row, index) => {
-                        const isSogAbnormal = Math.abs(row.sog_diff || 0) > 6;
-                        const isCogAbnormal = Math.abs(row.cog_diff || 0) > anomalyCofThreshold;
-
-                        return (
-                          <tr 
-                            key={`feat-row-${index}`}
-                            className={`hover:bg-slate-900/40 transition-colors ${index === currentPlayIdx ? 'bg-teal-500/10' : ''}`}
-                          >
-                            <td className="p-3 font-semibold text-slate-500 text-center">{index + 1}</td>
-                            <td className="p-3 text-slate-400">{row.mmsi}</td>
-                            <td className="p-3 text-slate-400/80">{row.timestamp}</td>
-                            <td className="p-3 text-teal-400 font-semibold">{row.lat.toFixed(5)}</td>
-                            <td className="p-3 text-teal-400 font-semibold">{row.lon.toFixed(5)}</td>
-                            <td className="p-3 text-orange-300 font-bold">{row.sog} kts</td>
-                            <td className="p-3 text-orange-300">{row.cog}°</td>
-                            <td className="p-3 text-slate-500">{row.lat_lag1?.toFixed(5) || "-"}</td>
-                            <td className="p-3 text-slate-500">{row.lon_lag1?.toFixed(5) || "-"}</td>
-                            <td className={`p-3 font-bold ${isSogAbnormal ? 'text-red-400 bg-red-500/5' : 'text-slate-400'}`}>
-                              {row.sog_diff !== null && row.sog_diff > 0 ? `+${row.sog_diff}` : row.sog_diff} kts
-                            </td>
-                            <td className={`p-3 font-bold ${isCogAbnormal ? 'text-amber-400 bg-amber-500/5' : 'text-slate-400'}`}>
-                              {row.cog_diff !== null && row.cog_diff > 0 ? `+${row.cog_diff}` : row.cog_diff}°
-                            </td>
-                            <td className="p-3 text-emerald-400">{row.distance_from_lag ? `${row.distance_from_lag} km` : '-'}</td>
-                          </tr>
-                        );
-                      })}
-                    </tbody>
-                  </table>
+                <div className="p-3.5 bg-slate-900/60 rounded border border-slate-800 text-xs leading-relaxed text-slate-300">
+                  <p className="font-semibold text-teal-400 mb-1">💡 본 내보내기 스크립트 특장점:</p>
+                  <ul className="list-disc list-inside space-y-1 text-slate-400 text-[11px]">
+                    <li>한국 행정정보에서 다수 배포되는 깨진 한글 파일 인코딩(CP949, EUC-KR) 자동 유추 및 로딩 지원.</li>
+                    <li>사용자가 선택한 컬럼 검수 및 SOG(속도) 노이즈 이상치를 완벽하게 피처 전처리.</li>
+                    <li>웹상에서 동적으로 조정한 <strong className="text-teal-400">속도 필터치 {maxSpeedKts} kts</strong> 와 <strong className="text-amber-400">급선회 임계치 {anomalyCofThreshold}°</strong> 가 소스코드 내 즉시 반영 계산.</li>
+                    <li>2차 물리 공간 보간을 통해 다음 예측 덤프 위치 생성 및 지오펜스 오염 이탈을 유추하고 CSV 백업 생성.</li>
+                  </ul>
                 </div>
 
+                {/* VISUAL CODE AREA */}
+                <div className="relative rounded overflow-hidden border border-slate-800 bg-[#03060a]">
+                  <div className="bg-[#090f19] px-4 py-2 flex items-center justify-between border-b border-slate-800/80 text-[10px] font-mono text-slate-500">
+                    <span>ais_surveillance_pipeline.py</span>
+                    <span>PYTHON SOURCE CODE (UTF-8)</span>
+                  </div>
+                  
+                  <pre className="p-4 overflow-x-auto font-mono text-xs text-slate-300 leading-relaxed text-left max-h-[550px] custom-scrollbar select-text selection:bg-teal-500/20">
+                    <code>
+                      {generatePythonCode({
+                        maxSpeedKts,
+                        anomalyCofThreshold,
+                        isPredictable: diagnostic?.isPredictable || false,
+                        mapping: columnMapping
+                      })}
+                    </code>
+                  </pre>
+                </div>
               </div>
-            )}
-          </div>
 
-        </main>
+            </div>
+          )}
 
-      </div>
-
-      {/* FOOTER CO-ORD STATUS BAR */}
-      <footer className="border-t border-slate-900 bg-slate-950 py-3 px-6 text-center select-none shrink-0 flex flex-col sm:flex-row items-center justify-between gap-3 text-xs text-slate-500">
-        <span className="font-mono">
-          © 2026 대한민국 AIS 선박 운항 안보 레이더 플랫폼 - XGBoost 실시간 분석 연구단
-        </span>
-        <div className="flex items-center gap-2">
-          <span className="h-1.5 w-1.5 rounded-full bg-teal-500" />
-          <span className="font-mono text-[10px] text-slate-400">
-            GPU ACCELERATION ACTIVE • EST. ERR MAX: 450m
-          </span>
         </div>
-      </footer>
+
+      </main>
 
     </div>
   );
