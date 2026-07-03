@@ -77,7 +77,7 @@ export function autoDetectColumns(headers: string[]): ColumnMapping {
     lengthRight: null
   };
 
-  const clean = (s: string) => s.toLowerCase().replace(/[\s_\-]/g, "");
+  const clean = (s: string) => (s || '').toLowerCase().replace(/[\s_\-]/g, "");
 
   headers.forEach(h => {
     const c = clean(h);
@@ -156,8 +156,6 @@ export function performDiagnostic(
   if (!mapping.lat) missingRequiredColumns.push("Latitude (위도)");
   if (!mapping.lon) missingRequiredColumns.push("Longitude (경도)");
 
-  const isPredictable = missingRequiredColumns.length === 0;
-
   // 인덱스 맵 생성
   const idxMap = {
     mmsi: mapping.mmsi ? headers.indexOf(mapping.mmsi) : -1,
@@ -174,6 +172,44 @@ export function performDiagnostic(
     lengthLeft: mapping.lengthLeft ? headers.indexOf(mapping.lengthLeft) : -1,
     lengthRight: mapping.lengthRight ? headers.indexOf(mapping.lengthRight) : -1,
   };
+
+  // 같은 선박의 연속 좌표 3개 이상 조건 추가 검증
+  let hasThreeConsecutiveCoords = false;
+  if (missingRequiredColumns.length === 0) {
+    if (idxMap.lat !== -1 && idxMap.lon !== -1 && idxMap.mmsi !== -1) {
+      const consecutiveCounts: Record<string, number> = {};
+      const maxConsecutive: Record<string, number> = {};
+      
+      parsedRows.forEach(row => {
+        const mmsiVal = row[idxMap.mmsi] || "";
+        if (!mmsiVal) return;
+        
+        const latVal = parseFloat(row[idxMap.lat]);
+        const lonVal = parseFloat(row[idxMap.lon]);
+        
+        const isValidCoord = !isNaN(latVal) && !isNaN(lonVal) && latVal !== 0 && lonVal !== 0 && latVal <= 90 && latVal >= -90 && lonVal <= 180 && lonVal >= -185;
+        
+        if (isValidCoord) {
+          consecutiveCounts[mmsiVal] = (consecutiveCounts[mmsiVal] || 0) + 1;
+          if (consecutiveCounts[mmsiVal] > (maxConsecutive[mmsiVal] || 0)) {
+            maxConsecutive[mmsiVal] = consecutiveCounts[mmsiVal];
+          }
+        } else {
+          consecutiveCounts[mmsiVal] = 0;
+        }
+      });
+      
+      hasThreeConsecutiveCoords = Object.values(maxConsecutive).some(count => count >= 3);
+    }
+  }
+
+  const isPredictable = missingRequiredColumns.length === 0 && hasThreeConsecutiveCoords;
+
+  // IMO 칼럼 존재 확인 (식별번호(IMO) 등의 한글명 매핑 보완)
+  const imoIdx = headers.findIndex(h => {
+    const c = h.toLowerCase().replace(/[\s_\-()]/g, "");
+    return c === "imo" || c.includes("선박식별번호") || c === "imo번호" || c === "선박식별번호imo";
+  });
 
   const uniqueVessels = new Set<string>();
   let missingVesselNameCount = 0;
@@ -229,11 +265,45 @@ export function performDiagnostic(
       missingVesselNameCount++;
     }
 
-    // 호출부호 누락
+    // IMO 식별누락/무효값(0) 정교 집계 및 품질 이슈 로깅
+    if (imoIdx !== -1) {
+      const imoVal = (row[imoIdx] || "").trim();
+      if (!imoVal || imoVal === "0" || imoVal === "N/A" || imoVal === "null" || imoVal === "undefined") {
+        missingImoCount++;
+        if (rIdx < 20) {
+          issues.push({
+            rowIdx: rowNum,
+            mmsi: mmsiVal || "미상",
+            timestamp: timeVal || "N/A",
+            column: headers[imoIdx] || "IMO",
+            value: imoVal,
+            issueType: 'MISSING',
+            severity: 'low',
+            message: `${rowNum}행: 선박식별번호(IMO) 정보가 누락되었거나 무효값(0)인 행입니다.`
+          });
+        }
+      }
+    } else {
+      missingImoCount++;
+    }
+
+    // 호출부호 누락/무효값(0) 정교 집계 및 품질 이슈 로깅
     if (idxMap.callSign !== -1) {
-      const call = row[idxMap.callSign] || "";
-      if (!call.trim()) {
+      const call = (row[idxMap.callSign] || "").trim();
+      if (!call || call === "0" || call === "N/A" || call === "null" || call === "undefined") {
         missingCallSignCount++;
+        if (rIdx < 20) {
+          issues.push({
+            rowIdx: rowNum,
+            mmsi: mmsiVal || "미상",
+            timestamp: timeVal || "N/A",
+            column: mapping.callSign || "호출부호",
+            value: call || "EMPTY",
+            issueType: 'MISSING',
+            severity: 'low',
+            message: `${rowNum}행: 호출부호가 공백값 또는 비식별 무기명(0) 상태입니다.`
+          });
+        }
       }
     } else {
       missingCallSignCount++;
@@ -399,15 +469,14 @@ export function generatePythonCode(params: {
 # -*- coding: utf-8 -*-
 """
 ================================================================================
-인공지능 기반 산호초 보호 및 해양 오염원 실시간 감시 시스템 - 로컬 데이터 분석 모듈
+물리 가감속 관성 기반 산호초 지오펜스 감시 시스템 - 로컬 데이터 분석 모듈
 ================================================================================
 
-본 파이썬 프로그램은 웹 시뮬레이터와 완전히 연동되며, 사용자가 로컬 환경(PC/서버)에서
-대용량 AIS 해양 데이터를 전처리하고 물리 기반/AI 기반 경로를 정밀 탐색할 수 있게 지원합니다.
+본 파이썬 프로그램은 웹 시뮬레이터와 연동되며, 사용자가 로컬 환경에서
+대용량 AIS 해양 데이터를 전처리하고 물리 가감속 기반 경로 추적을 탐색할 수 있게 지원합니다.
 
 [실행 가이드]
-$ pip install pandas numpy scikit-learn
-(XGBoost를 선택적으로 사용하려면: $ pip install xgboost)
+$ pip install pandas numpy
 
 $ python ais_surveillance_pipeline.py --input data.csv
 """
@@ -427,7 +496,7 @@ from datetime import datetime
 COLUMN_MAPPING = ${mapStr}
 
 MAX_SPEED_THRESHOLD = ${params.maxSpeedKts}     # 비정상 데이터 필터링 최고 속도 (kts)
-COG_CHANGE_THRESHOLD = ${params.anomalyCofThreshold}   # 오염 의심 급선회 기준 각도 (degree)
+COG_CHANGE_THRESHOLD = ${params.anomalyCofThreshold}   # 특이 기동 급선회 기준 각도 (degree)
 
 def load_and_decode_csv(filepath):
     """
@@ -581,7 +650,7 @@ def run_trajectory_forecaster(df):
                     'mmsi': row[mmsi_col],
                     'time': str(row[time_col]),
                     'type': '위험 기동 이탈',
-                    'message': f"예상 안전 항로에서 {err_dist:.1f}m 급격히 이격된 특이 기동 포착 (오염물 투기 의심)"
+                    'message': f"예상 안전 항로에서 {err_dist:.1f}m 급격히 이격된 특이 기동 포착 (항로 이탈 의심)"
                 })
         else:
             predictions.append((i, np.nan, np.nan, 0))
@@ -596,7 +665,7 @@ def run_trajectory_forecaster(df):
                 'mmsi': row[mmsi_col],
                 'time': str(row[time_col]),
                 'type': '산호초 침범 위반',
-                'message': "⚠️ 환경 재난: 허가되지 않은 선박이 보호 구역 내측 경계를 과속으로 돌파 진행 중!"
+                'message': "⚠️ 환경 위반: 허가되지 않은 선박이 보호 구역 내측 경계를 돌파 진행 중!"
             })
             
     # 데이터 장착 및 로컬 출력
@@ -604,7 +673,7 @@ def run_trajectory_forecaster(df):
     clean_df = clean_df.join(predictions_df.set_index('row_idx'))
     
     print(f"- 관성기반 자율 경로 시뮬레이션 완료 (통과 레코드 수: {len(clean_df)}행)")
-    print(f"- 경로 이탈 오염기동 및 경보 위협 건수: {len(anomalies)} 건")
+    print(f"- 경로 이탈 특이 기동 및 경보 위협 건수: {len(anomalies)} 건")
     
     if anomalies:
         print("\\n[보호소 통제 센터 실시간 경보 로그]")
@@ -724,7 +793,7 @@ export const SAMPLE_A_TRACK: VesselPreset[] = [
     mmsi: "440267812",
     name: "의심 선박 A (급선회 및 연안 이탈)",
     type: "Dangerous Vessel A",
-    description: "관찰 도중 1215 분 경과 시점에서 갑작스럽게 예기치 못한 우현 90도 격각 선회를 가하여 해양 오염 자원 유출 의심을 받고 있는 비정상 주행 선박입니다.",
+    description: "관찰 도중 1215 분 경과 시점에서 갑작스럽게 예기치 못한 우현 90도 격각 선회를 가하여 정상 항로를 탈출한 비정상 주행 선박입니다.",
     points: [
       {
         mmsi: "440267812",
@@ -759,7 +828,7 @@ export const SAMPLE_A_TRACK: VesselPreset[] = [
         lat: 34.618,
         lon: 129.215,
         sog: 11.2,
-        cog: 172.5, // 갑자기 선수방위 대폭 변경 및 감속 (오염 투기 의혹!)
+        cog: 172.5, // 갑자기 선수방위 대폭 변경 및 감속 (급격한 방위 변경!)
         originalRow: { "선박번호": "440267812", "수신시각": "2026-06-23 12:15:00", "위도": "34.618", "경도": "129.215", "속도": "11.2", "선수방위": "172.5", "선박명": "의심 선박 A" }
       },
       {
